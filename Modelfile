@@ -1,0 +1,19 @@
+# Ollama Modelfile — imports the existing Gemma 4 12B GGUF for GPU inference.
+# Create the model with:  ollama create gemma4-12b -f Modelfile
+#
+# Ollama auto-detects the Gemma architecture and applies the correct chat
+# template, so only FROM is required. Generation params (temperature, num_ctx)
+# are sent per-request by modules/llm.py.
+
+FROM /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf
+
+# --- Vision / multimodal (optional) ---
+# Gemma 4 is multimodal. To enable image input you also need the projector.
+# Recent Ollama versions accept the mmproj via a second FROM line — verify
+# against your installed Ollama version (`ollama help create`) before relying
+# on it, then uncomment:
+#
+# FROM /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/mmproj-gemma-4-12B-it-BF16.gguf
+#
+# Note: the voice loop in assistant.py is text-only, so vision is latent
+# capability until you wire a webcam frame into llm.chat().

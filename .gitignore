@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Models / large binaries (download via scripts)
+models/
+*.onnx
+*.bin
+*.gguf
+*.pt
+*.safetensors
+
+# Local config / secrets
+settings.local.json
+.env
+
+# OS / editor
+.DS_Store
+*.swp

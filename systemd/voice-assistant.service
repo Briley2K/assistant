@@ -1,0 +1,16 @@
+[Unit]
+Description=Local Voice Assistant (wake word + STT + LLM + TTS)
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/assistant
+ExecStart=/usr/bin/python3 %h/assistant/assistant.py
+Restart=on-failure
+RestartSec=5
+# Inherit the graphical session env so audio (PipeWire) is reachable.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

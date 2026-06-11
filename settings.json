@@ -1,0 +1,18 @@
+{
+  "system_prompt": "You are a helpful, concise voice assistant. Keep responses short and natural-sounding — you are speaking, not writing. Avoid bullet points, markdown, or long lists unless specifically asked. When the user explicitly asks you to be thorough, detailed, or long-winded, do so.",
+  "stt_mode": "native",
+  "tts_engine": "kokoro",
+  "kokoro_voice": "af_heart",
+  "kokoro_speed": 1.0,
+  "wake_word": "hey_jarvis",
+  "wake_word_threshold": 0.5,
+  "llm_backend": "auto",
+  "ollama_host": "http://localhost:11434",
+  "ollama_model": "gemma4-12b",
+  "whisper_model": "small",
+  "api": {
+    "base_url": "",
+    "api_key": "",
+    "model": ""
+  }
+}

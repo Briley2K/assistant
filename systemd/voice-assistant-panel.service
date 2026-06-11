@@ -1,0 +1,14 @@
+[Unit]
+Description=Voice Assistant Control Panel (http://localhost:5005)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/assistant
+ExecStart=/usr/bin/python3 %h/assistant/control_panel.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

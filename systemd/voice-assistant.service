@@ -6,7 +6,7 @@ Wants=pipewire.service
 [Service]
 Type=simple
 WorkingDirectory=%h/assistant
-ExecStart=/usr/bin/python3 %h/assistant/assistant.py
+ExecStart=%h/assistant/.venv/bin/python3 %h/assistant/assistant.py
 Restart=on-failure
 RestartSec=5
 # Inherit the graphical session env so audio (PipeWire) is reachable.

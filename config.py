@@ -12,7 +12,15 @@ SETTINGS_PATH = os.path.join(_BASE, "settings.json")
 
 # Bundled openWakeWord models live here; a wake-word key maps to "<key>_v0.1".
 _OWW_DIR = os.path.join(os.path.dirname(_oww.__file__), "resources", "models")
-WAKE_WORDS = ["hey_jarvis", "alexa", "hey_mycroft", "hey_marvin", "timer"]
+# Phrases with a pretrained openWakeWord model (instant, near-zero CPU). Any
+# other phrase falls back to the trained Whisper listener (modules/wake_word.py).
+BUNDLED_WAKE_WORDS = {
+    "hey jarvis":  "hey_jarvis",
+    "alexa":       "alexa",
+    "hey mycroft": "hey_mycroft",
+    "hey marvin":  "hey_marvin",
+    "timer":       "timer",
+}
 
 
 def _load_settings() -> dict:
@@ -28,10 +36,26 @@ _S = _load_settings()
 
 
 # --- LLM ---
-_GGUF_DIR = ("/run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/"
-             "lmstudio-community/gemma-4-12B-it-GGUF")
-GEMMA_MODEL_PATH  = os.path.join(_GGUF_DIR, "gemma-4-12B-it-Q4_K_M.gguf")
-GEMMA_MMPROJ_PATH = os.path.join(_GGUF_DIR, "mmproj-gemma-4-12B-it-BF16.gguf")  # audio+vision
+# Search order: local copy (downloaded by setup.sh), then the LM Studio copy on
+# the Windows drive. If neither exists yet, paths point at the local download
+# target so download_models.sh knows where to put them.
+_GGUF_DIRS = [
+    os.path.join(_BASE, "models", "gemma"),
+    ("/run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/"
+     "lmstudio-community/gemma-4-12B-it-GGUF"),
+]
+
+
+def _find_gguf(filename: str) -> str:
+    for d in _GGUF_DIRS:
+        path = os.path.join(d, filename)
+        if os.path.exists(path):
+            return path
+    return os.path.join(_GGUF_DIRS[0], filename)
+
+
+GEMMA_MODEL_PATH  = _find_gguf("gemma-4-12B-it-Q4_K_M.gguf")
+GEMMA_MMPROJ_PATH = _find_gguf("mmproj-gemma-4-12B-it-BF16.gguf")  # audio+vision
 
 # Speech input: "native" feeds audio straight to Gemma 4 (no Whisper);
 # "whisper" transcribes first, then sends text.
@@ -48,23 +72,114 @@ API_BASE_URL = _API.get("base_url", "")
 API_KEY      = _API.get("api_key", "")
 API_MODEL    = _API.get("model", "")
 
-LLM_N_GPU_LAYERS = -1        # llama-cpp only: 0 = CPU. (GPU build blocked by gcc15/CUDA13 here)
 LLM_N_CTX        = 4096
 LLM_TEMPERATURE  = 0.7
 CONTEXT_TURNS    = 10       # max conversation turns to keep in memory
+
+# Where to run the LLM: "auto" (GPU if it has enough free VRAM, else CPU),
+# "gpu" (force full GPU offload), or "cpu". "auto" is the default.
+LLM_DEVICE = _S.get("llm_device", "auto")
+
+# Headroom on top of the model file(s) for the KV cache (n_ctx) and compute
+# buffers — the model needs more VRAM than its on-disk size.
+_VRAM_OVERHEAD_MB = 2000
+
+
+def _gpu_free_mb() -> int | None:
+    """Free VRAM (MB) on the largest CUDA device, or None if there's no usable
+    NVIDIA GPU. Uses nvidia-smi, which ships with any working CUDA driver."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+    return max(vals) if vals else None
+
+
+def _llm_vram_need_mb() -> int:
+    """Estimated VRAM to fit the LLM fully on the GPU: model file(s) + overhead."""
+    need = _VRAM_OVERHEAD_MB
+    paths = [GEMMA_MODEL_PATH]
+    if STT_MODE == "native":
+        paths.append(GEMMA_MMPROJ_PATH)   # mmproj is co-loaded for native audio
+    for p in paths:
+        if os.path.exists(p):
+            need += os.path.getsize(p) // (1024 * 1024)
+    return need
+
+
+def _resolve_gpu_layers() -> int:
+    """Layers to offload to GPU: -1 = all, 0 = none (CPU). Honors LLM_DEVICE."""
+    if LLM_DEVICE == "cpu":
+        return 0
+    if LLM_DEVICE == "gpu":
+        return -1
+    free = _gpu_free_mb()                  # auto
+    if free is None:
+        return 0                            # no GPU → CPU + RAM
+    return -1 if free >= _llm_vram_need_mb() else 0
+
+
+# llama-cpp only: number of model layers to put on the GPU (-1 all, 0 CPU).
+LLM_N_GPU_LAYERS = _resolve_gpu_layers()
 
 SYSTEM_PROMPT = _S.get(
     "system_prompt",
     "You are a helpful, concise voice assistant. Keep responses short.",
 )
 
+# --- Sleep mode ---
+# Saying "<wake word>, <sleep command>" unloads the LLM (frees GPU memory) but
+# keeps wake-word detection running. "<wake word>, <wake command>" reloads it.
+SLEEP_COMMAND = _S.get("sleep_command", "go to sleep")
+WAKE_COMMAND  = _S.get("wake_command", "wake up")
+WAKE_REPLY    = _S.get("wake_reply", "Awake and ready.")
+SLEEP_REPLY   = _S.get("sleep_reply", "Going to sleep.")
+
+# Whisper model used only while asleep to spot the wake command. Runs on the
+# CPU so the GPU stays completely free for other work during sleep.
+SLEEP_WHISPER_MODEL = _S.get("sleep_whisper_model", "base")
+
+# --- Status orb overlay (Siri-style, top-right of screen) ---
+OVERLAY_ENABLED = bool(_S.get("overlay", True))
+OVERLAY_PORT    = int(_S.get("overlay_port", 5006))
+
+# --- Conversation log (shown live in the control panel) ---
+CHATLOG_ENABLED = bool(_S.get("chatlog", True))
+CHATLOG_PATH    = os.path.join(_BASE, "logs", "chat.jsonl")
+
+# --- Skills / tools ---
+SKILLS_ENABLED  = bool(_S.get("skills", True))
+SKILLS_DISABLED = set(_S.get("skills_disabled", []))   # skill names to turn off
+
+# Weather skill default ("home") location. Set a place name in the control
+# panel; lat/lon are optional and take precedence if both are given.
+WEATHER_PLACE = _S.get("weather_place", "")
+WEATHER_LAT   = _S.get("weather_lat", None)
+WEATHER_LON   = _S.get("weather_lon", None)
+WEATHER_UNITS = _S.get("weather_units", "fahrenheit")   # or "celsius"
+
 # --- Wake word ---
-_WAKE = _S.get("wake_word", "hey_jarvis")
-if _WAKE not in WAKE_WORDS:
-    _WAKE = "hey_jarvis"
-WAKE_WORD_MODEL     = os.path.join(_OWW_DIR, f"{_WAKE}_v0.1.onnx")
-WAKE_WORD_LABEL     = f"{_WAKE}_v0.1"
+# Free-text phrase. Old settings stored e.g. "hey_jarvis", so underscores are
+# treated as spaces. Phrases in BUNDLED_WAKE_WORDS use the pretrained model;
+# anything else is trained once at startup (variants file below).
+WAKE_PHRASE = " ".join(str(_S.get("wake_word", "hey cleo")).lower().replace("_", " ").split()) \
+              or "hey cleo"
+
+_WAKE_KEY = BUNDLED_WAKE_WORDS.get(WAKE_PHRASE)
+WAKE_WORD_MODEL = os.path.join(_OWW_DIR, f"{_WAKE_KEY}_v0.1.onnx") if _WAKE_KEY else None
+WAKE_WORD_LABEL = f"{_WAKE_KEY}_v0.1" if _WAKE_KEY else None
 WAKE_WORD_THRESHOLD = float(_S.get("wake_word_threshold", 0.5))
+
+# Custom-phrase training output: accepted transcription variants of the phrase.
+WAKE_VARIANTS_PATH = os.path.join(
+    _BASE, "models", "wake", WAKE_PHRASE.replace(" ", "_") + ".json")
 
 # --- Speech-to-text (Whisper) ---
 WHISPER_MODEL    = _S.get("whisper_model", "small")

@@ -14,13 +14,26 @@ from flask import Flask, request, redirect, url_for, render_template_string
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(BASE, "settings.json")
+CHATLOG_PATH = os.path.join(BASE, "logs", "chat.jsonl")   # written by modules/chatlog.py
 SERVICE = "voice-assistant.service"
 
-WAKE_WORDS = ["hey_jarvis", "alexa", "hey_mycroft", "hey_marvin", "timer"]
+BUNDLED_WAKE_WORDS = ["hey jarvis", "alexa", "hey mycroft", "hey marvin", "timer"]
 WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 BACKENDS = ["auto", "ollama", "llamacpp", "api"]
+LLM_DEVICES = ["auto", "gpu", "cpu"]
 STT_MODES = ["native", "whisper"]
 TTS_ENGINES = ["kokoro", "piper"]
+
+
+def skill_list():
+    """(name, description) for every registered skill, for the panel."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        from modules import skills
+        return [(s.name, s.description) for s in skills.all_skills()]
+    except Exception:
+        return []
 
 
 def kokoro_voice_names():
@@ -78,12 +91,15 @@ def index():
         PAGE,
         s=load_settings(),
         state=service_state(),
-        wake_words=WAKE_WORDS,
+        bundled_wake_words=BUNDLED_WAKE_WORDS,
         whisper_models=WHISPER_MODELS,
         backends=BACKENDS,
+        llm_devices=LLM_DEVICES,
         stt_modes=STT_MODES,
         tts_engines=TTS_ENGINES,
         kokoro_voices=kokoro_voice_names(),
+        skills=skill_list(),
+        disabled=set(load_settings().get("skills_disabled", [])),
         msg=request.args.get("msg", ""),
     )
 
@@ -97,9 +113,22 @@ def save():
     s["tts_engine"]          = f.get("tts_engine", "kokoro")
     s["kokoro_voice"]        = f.get("kokoro_voice", "af_heart")
     s["kokoro_speed"]        = float(f.get("kokoro_speed", 1.0))
-    s["wake_word"]           = f.get("wake_word", "hey_jarvis")
+    s["wake_word"]           = " ".join(f.get("wake_word", "").lower().split()) or "hey cleo"
     s["wake_word_threshold"] = float(f.get("wake_word_threshold", 0.5))
+    s["overlay"]             = bool(f.get("overlay"))
+    s["sleep_command"]       = f.get("sleep_command", "").strip() or "go to sleep"
+    s["wake_command"]        = f.get("wake_command", "").strip() or "wake up"
+    s["sleep_reply"]         = f.get("sleep_reply", "").strip() or "Going to sleep."
+    s["wake_reply"]          = f.get("wake_reply", "").strip() or "Awake and ready."
     s["llm_backend"]         = f.get("llm_backend", "auto")
+    s["llm_device"]          = f.get("llm_device", "auto")
+
+    s["skills"]        = bool(f.get("skills"))
+    enabled_skills     = set(f.getlist("skill_on"))
+    all_skill_names    = [n for n, _ in skill_list()]
+    s["skills_disabled"] = [n for n in all_skill_names if n not in enabled_skills]
+    s["weather_place"] = f.get("weather_place", "").strip()
+    s["weather_units"] = f.get("weather_units", "fahrenheit")
     s["ollama_host"]         = f.get("ollama_host", "").strip()
     s["ollama_model"]        = f.get("ollama_model", "").strip()
     s["whisper_model"]       = f.get("whisper_model", "small")
@@ -165,6 +194,44 @@ def control():
     return redirect(url_for("index", msg=msg))
 
 
+# --------------------------------------------------------------------------
+# Conversation log (live chat view)
+# --------------------------------------------------------------------------
+def read_chat(limit: int = 300) -> list:
+    try:
+        with open(CHATLOG_PATH) as f:
+            lines = f.readlines()[-limit:]
+    except FileNotFoundError:
+        return []
+    turns = []
+    for line in lines:
+        try:
+            turns.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return turns
+
+
+@app.route("/chat")
+def chat():
+    return render_template_string(CHAT_PAGE)
+
+
+@app.route("/chat.json")
+def chat_json():
+    from flask import jsonify
+    return jsonify(read_chat())
+
+
+@app.route("/chat/clear", methods=["POST"])
+def chat_clear():
+    try:
+        open(CHATLOG_PATH, "w").close()
+    except OSError:
+        pass
+    return ("", 204)
+
+
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Voice Assistant</title>
 <style>
@@ -208,6 +275,7 @@ PAGE = """<!doctype html>
   </form>
   <p class="hint">Autostart runs at login. For start-before-login, also run
      <code>sudo loginctl enable-linger $USER</code>.</p>
+  <div class="btns"><a href="/chat" target="_blank"><button type="button">💬 View conversation</button></a></div>
 </div>
 
 <form method="post" action="/save">
@@ -227,12 +295,9 @@ PAGE = """<!doctype html>
   <p class="hint">native = Gemma 4 hears audio directly (no Whisper). whisper = transcribe first.</p>
   <div class="row">
     <div>
-      <label>Wake word</label>
-      <select name="wake_word">
-        {% for w in wake_words %}
-        <option value="{{ w }}" {{ 'selected' if s.wake_word==w else '' }}>{{ w.replace('_',' ') }}</option>
-        {% endfor %}
-      </select>
+      <label>Wake word / phrase</label>
+      <input name="wake_word" placeholder="hey cleo"
+             value="{{ (s.wake_word or 'hey cleo').replace('_', ' ') }}">
     </div>
     <div>
       <label>Detection threshold (0–1)</label>
@@ -248,6 +313,33 @@ PAGE = """<!doctype html>
       </select>
     </div>
   </div>
+  <p class="hint">Any phrase works — a new phrase is trained automatically when the assistant
+     (re)starts (~30 s), and it announces when the wake word is ready.
+     These have pretrained instant models: {{ bundled_wake_words|join(', ') }}
+     (threshold applies to those only).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Sleep mode</h2>
+  <div class="row">
+    <div><label>Sleep command</label><input name="sleep_command" value="{{ s.sleep_command or 'go to sleep' }}"></div>
+    <div><label>Wake command</label><input name="wake_command" value="{{ s.wake_command or 'wake up' }}"></div>
+  </div>
+  <div class="row">
+    <div><label>Sleep reply</label><input name="sleep_reply" value="{{ s.sleep_reply or 'Going to sleep.' }}"></div>
+    <div><label>Wake reply</label><input name="wake_reply" value="{{ s.wake_reply or 'Awake and ready.' }}"></div>
+  </div>
+  <p class="hint">Saying "&lt;wake word&gt;, &lt;sleep command&gt;" unloads the LLM to free GPU memory but keeps
+     listening for the wake word. "&lt;wake word&gt;, &lt;wake command&gt;" reloads the model, then it speaks the wake reply.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Status orb</h2>
+  <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
+    <input type="checkbox" name="overlay" value="1" style="width:auto"
+           {{ 'checked' if s.get('overlay', True) else '' }}>
+    Show the Siri-style orb in the top-right of the screen while listening / replying
+  </label>
 </div>
 
 <div class="card">
@@ -281,6 +373,32 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
+  <h2 style="margin-top:0">Skills (tools)</h2>
+  <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
+    <input type="checkbox" name="skills" value="1" style="width:auto"
+           {{ 'checked' if s.get('skills', True) else '' }}>
+    Enable skills — let Cleo call tools (time, weather, timers…)
+  </label>
+  {% for name, desc in skills %}
+  <label style="display:flex; align-items:center; gap:.5rem; margin:.15rem 0; font-size:.82rem;">
+    <input type="checkbox" name="skill_on" value="{{ name }}" style="width:auto"
+           {{ 'checked' if name not in disabled else '' }}>
+    <b>{{ name }}</b> — {{ desc }}
+  </label>
+  {% endfor %}
+  <div class="row" style="margin-top:.6rem">
+    <div><label>Weather home location</label>
+      <input name="weather_place" value="{{ s.weather_place or '' }}" placeholder="Dallas, Texas"></div>
+    <div><label>Temperature units</label>
+      <select name="weather_units">
+        <option value="fahrenheit" {{ 'selected' if (s.weather_units or 'fahrenheit')=='fahrenheit' else '' }}>Fahrenheit</option>
+        <option value="celsius" {{ 'selected' if s.weather_units=='celsius' else '' }}>Celsius</option>
+      </select></div>
+  </div>
+  <p class="hint">Weather uses open-meteo (free, no key). The home location is used when you don't name a place.</p>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">LLM connection</h2>
   <label>Backend</label>
   <select name="llm_backend">
@@ -288,7 +406,15 @@ PAGE = """<!doctype html>
     <option value="{{ b }}" {{ 'selected' if s.llm_backend==b else '' }}>{{ b }}</option>
     {% endfor %}
   </select>
-  <p class="hint">auto = Ollama if running, else local CPU. "api" = remote endpoint below.</p>
+  <p class="hint">auto = Ollama if running, else local llama-cpp. "api" = remote endpoint below.</p>
+  <label>Device (local llama-cpp)</label>
+  <select name="llm_device">
+    {% for d in llm_devices %}
+    <option value="{{ d }}" {{ 'selected' if (s.llm_device or 'auto')==d else '' }}>{{ d }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">auto = GPU if it has enough free VRAM for the model, otherwise CPU + RAM.
+     gpu / cpu force one. (Needs a CUDA-enabled llama-cpp build for GPU — see enable_gpu_llm.sh.)</p>
   <div class="row">
     <div><label>Ollama host</label><input name="ollama_host" value="{{ s.ollama_host or '' }}"></div>
     <div><label>Ollama model</label><input name="ollama_model" value="{{ s.ollama_model or '' }}"></div>
@@ -312,6 +438,65 @@ PAGE = """<!doctype html>
   <button type="submit" name="restart" value="1" class="secondary">Save &amp; restart assistant</button>
 </div>
 </form>
+</body></html>"""
+
+
+CHAT_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Conversation — Voice Assistant</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 0 auto;
+         padding: 0 1rem 6rem; background:#15171c; color:#e6e6e6; }
+  header { position:sticky; top:0; background:#15171c; padding:1rem 0 .6rem;
+           border-bottom:1px solid #2c313c; display:flex; align-items:center; gap:1rem; }
+  h1 { font-size:1.2rem; margin:0; flex:1; }
+  .dot { width:.6rem; height:.6rem; border-radius:50%; background:#555; display:inline-block; }
+  .dot.live { background:#7ee2a8; }
+  button { background:#333a47; color:#fff; border:0; border-radius:6px; padding:.45rem .8rem;
+           font-size:.85rem; cursor:pointer; } button:hover { filter:brightness(1.2); }
+  .turn { display:flex; margin:.6rem 0; }
+  .turn.user { justify-content:flex-end; }
+  .bubble { max-width:78%; padding:.55rem .85rem; border-radius:14px; line-height:1.35;
+            white-space:pre-wrap; word-wrap:break-word; }
+  .user .bubble { background:#2d6cdf; color:#fff; border-bottom-right-radius:4px; }
+  .assistant .bubble { background:#1d2027; border:1px solid #2c313c; border-bottom-left-radius:4px; }
+  .time { font-size:.66rem; color:#778; margin:.15rem .3rem 0; }
+  .empty { color:#778; text-align:center; margin-top:3rem; }
+</style></head><body>
+<header>
+  <h1>💬 Conversation</h1>
+  <span class="dot" id="live"></span>
+  <button onclick="clearChat()">Clear</button>
+</header>
+<div id="log"><p class="empty">No conversation yet. Say the wake word to start talking.</p></div>
+<script>
+let lastCount = -1;
+function fmt(ts){ const d = new Date(ts*1000);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+async function poll(){
+  let live = document.getElementById('live');
+  try {
+    const turns = await (await fetch('/chat.json')).json();
+    live.classList.add('live');
+    if (turns.length === lastCount) return;       // nothing new
+    const atBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 80;
+    lastCount = turns.length;
+    const log = document.getElementById('log');
+    if (!turns.length){ log.innerHTML = '<p class="empty">No conversation yet. Say the wake word to start talking.</p>'; return; }
+    log.innerHTML = turns.map(t => {
+      const who = t.role === 'user' ? 'user' : 'assistant';
+      const text = t.text.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      return '<div class="turn '+who+'"><div><div class="bubble">'+text+'</div>'
+           + '<div class="time" style="text-align:'+(who==='user'?'right':'left')+'">'+fmt(t.ts)+'</div></div></div>';
+    }).join('');
+    if (atBottom) window.scrollTo(0, document.body.scrollHeight);
+  } catch(e){ live.classList.remove('live'); }
+}
+async function clearChat(){
+  await fetch('/chat/clear', {method:'POST'}); lastCount = -1; poll();
+}
+poll(); setInterval(poll, 1500);
+</script>
 </body></html>"""
 
 

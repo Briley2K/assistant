@@ -17,10 +17,13 @@ engine/voice and hit **Test voice** in the control panel. Piper is the lighter f
 
 ```bash
 cd ~/assistant
-bash setup.sh            # one-time: Python deps (already done)
-bash download_models.sh  # one-time: Piper voice (already done)
-python3 assistant.py     # run it — say "Hey Jarvis"
+bash setup.sh                      # one-time: system deps, Python env, ALL models (~9 GB)
+.venv/bin/python3 assistant.py     # run it — say "Hey Jarvis"
 ```
+
+`setup.sh` is idempotent — re-run it any time; it skips anything already
+installed or downloaded (including the Gemma GGUF on the LM Studio drive,
+if mounted).
 
 ## Control panel (app interface)
 

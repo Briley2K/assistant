@@ -5,7 +5,10 @@
 # template, so only FROM is required. Generation params (temperature, num_ctx)
 # are sent per-request by modules/llm.py.
 
-FROM /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf
+# Local copy downloaded by setup.sh (path is relative to this Modelfile).
+# If you'd rather use the LM Studio copy on the Windows drive, swap in:
+#   /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf
+FROM ./models/gemma/gemma-4-12B-it-Q4_K_M.gguf
 
 # --- Vision / multimodal (optional) ---
 # Gemma 4 is multimodal. To enable image input you also need the projector.
@@ -13,7 +16,7 @@ FROM /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-c
 # against your installed Ollama version (`ollama help create`) before relying
 # on it, then uncomment:
 #
-# FROM /run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/lmstudio-community/gemma-4-12B-it-GGUF/mmproj-gemma-4-12B-it-BF16.gguf
+# FROM ./models/gemma/mmproj-gemma-4-12B-it-BF16.gguf
 #
 # Note: the voice loop in assistant.py is text-only, so vision is latent
 # capability until you wire a webcam frame into llm.chat().

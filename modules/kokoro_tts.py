@@ -34,7 +34,7 @@ def list_voices() -> list[str]:
     return _get().get_voices()
 
 
-def _infer(kok: Kokoro, phonemes: str, style_all: np.ndarray) -> np.ndarray:
+def _infer(kok: Kokoro, phonemes: str, style_all: np.ndarray, speed: float) -> np.ndarray:
     phonemes = phonemes[:MAX_PHONEME_LENGTH]
     tokens = kok.tokenizer.tokenize(phonemes)
     if not tokens:
@@ -45,19 +45,20 @@ def _infer(kok: Kokoro, phonemes: str, style_all: np.ndarray) -> np.ndarray:
     inputs = {
         key: [[0, *tokens, 0]],
         "style": style,
-        "speed": np.array([config.KOKORO_SPEED], dtype=np.float32),
+        "speed": np.array([speed], dtype=np.float32),
     }
     out = kok.sess.run(None, inputs)[0]
     return np.asarray(out).squeeze()
 
 
-def synth_wav(text: str, voice: str | None = None) -> bytes:
+def synth_wav(text: str, voice: str | None = None, speed: float | None = None) -> bytes:
     """Synthesize text → WAV bytes (24 kHz mono int16)."""
     kok = _get()
     voice = voice or config.KOKORO_VOICE
     if voice not in kok.voices:
         voice = "af_heart"
     style_all = np.asarray(kok.voices[voice])
+    speed = speed if speed is not None else config.KOKORO_SPEED
 
     pieces = []
     for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()):
@@ -65,7 +66,7 @@ def synth_wav(text: str, voice: str | None = None) -> bytes:
         if not sentence:
             continue
         phonemes = kok.tokenizer.phonemize(sentence, lang="en-us")
-        audio = _infer(kok, phonemes, style_all)
+        audio = _infer(kok, phonemes, style_all, speed)
         if audio.size:
             pieces.append(audio)
 

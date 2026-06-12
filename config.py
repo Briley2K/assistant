@@ -121,6 +121,11 @@ CONTEXT_TURNS    = 10       # max conversation turns to keep in memory
 # "gpu" (force full GPU offload), or "cpu". "auto" is the default.
 LLM_DEVICE = _S.get("llm_device", "auto")
 
+# Cap on the share of GPU *compute* (SMs) Cleo may use, 10-100. 100 = no limit.
+# Enforced via NVIDIA MPS (modules/gpu.py); does not affect VRAM. Applied at
+# startup, so a change takes effect on the next assistant restart.
+GPU_COMPUTE_PERCENT = max(10, min(100, int(_S.get("gpu_compute_percent", 100))))
+
 # Headroom on top of the model file(s) for the KV cache (n_ctx) and compute
 # buffers — the model needs more VRAM than its on-disk size.
 _VRAM_OVERHEAD_MB = 2000
@@ -182,6 +187,30 @@ SLEEP_COMMAND = _S.get("sleep_command", "go to sleep")
 WAKE_COMMAND  = _S.get("wake_command", "wake up")
 WAKE_REPLY    = _S.get("wake_reply", "Awake and ready.")
 SLEEP_REPLY   = _S.get("sleep_reply", "Going to sleep.")
+
+# Quick spoken acknowledgements: if the user says just the wake word and then
+# pauses, Cleo replies with one of these and keeps listening for the request.
+WAKE_ACKS = _S.get("wake_acks") or ["Yes?", "What's up?", "Yeah?"]
+
+# Conversational follow-up: after a reply, keep listening for more without
+# needing the wake word again. When the user pauses, Cleo asks if there's
+# anything else; the conversation only ends (speech input closes until the next
+# wake word) when the user declines or stays quiet.
+FOLLOWUP_ENABLED = bool(_S.get("followup_mode", True))
+FOLLOWUP_PROMPT  = _S.get("followup_prompt", "Is there anything else I can help with?")
+FOLLOWUP_SIGNOFF = _S.get("followup_signoff", "Okay, I'll be here if you need me.")
+
+# Screen viewing: let the user say "look at my screen" and Cleo captures a
+# monitor (via the ScreenCast portal) and looks at it. Native audio only — the
+# model needs the audio+vision mmproj. One-time GNOME share permission applies.
+SCREEN_VIEW_ENABLED = bool(_S.get("screen_view", True)) and STT_MODE == "native"
+SCREEN_PICK_PROMPT  = _S.get("screen_pick_prompt", "Which screen would you like me to look at?")
+
+# Side panel: when a reply contains read/copy content (code, a story, a poem, a
+# list), Cleo shows it in a side overlay with a Copy button instead of reading it
+# aloud. The overlay (overlay.py) polls logs/panel.json, written by modules/panel.
+SIDE_PANEL_ENABLED = bool(_S.get("side_panel", True))
+PANEL_PATH = os.path.join(_BASE, "logs", "panel.json")
 
 # Whisper model used only while asleep to spot the wake command. Runs on the
 # CPU so the GPU stays completely free for other work during sleep.
@@ -247,3 +276,18 @@ CHANNELS     = 1
 MIC_DEVICE   = None   # None = follow Ubuntu's selected mic (PipeWire default source).
                       # Override with a pw-record --target node name/serial if needed.
 SILENCE_MS   = 800    # ms of silence before ending recording
+
+# Cleo's speaking volume, 0.0-1.0 (1.0 = full scale). Applied per playback via
+# pw-play --volume, independent of the system volume. Read live from settings on
+# each utterance (see modules/audio), so a change takes effect without a restart.
+TTS_VOLUME   = max(0.0, min(1.0, float(_S.get("tts_volume", 1.0))))
+
+
+def tts_volume() -> float:
+    """Current speaking volume, re-read from settings.json so the control-panel
+    slider takes effect on the next utterance without restarting the assistant.
+    Falls back to the value loaded at startup if the file can't be read."""
+    try:
+        return max(0.0, min(1.0, float(_load_settings().get("tts_volume", TTS_VOLUME))))
+    except (TypeError, ValueError):
+        return TTS_VOLUME

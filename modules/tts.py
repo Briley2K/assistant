@@ -7,6 +7,7 @@ Both synthesize a WAV that is played via modules.audio (PipeWire default sink).
 import io
 import wave
 import re
+import time
 import queue
 import threading
 
@@ -67,6 +68,9 @@ class StreamSpeaker:
     def __init__(self):
         self._text_q: queue.Queue = queue.Queue()
         self._wav_q: queue.Queue = queue.Queue()
+        # Monotonic time the very first audio chunk began playing (None until
+        # then) — lets callers measure latency from generation to spoken audio.
+        self.first_play_ts = None
         self._synth_t = threading.Thread(target=self._synth_loop, daemon=True)
         self._play_t = threading.Thread(target=self._play_loop, daemon=True)
         self._synth_t.start()
@@ -91,6 +95,8 @@ class StreamSpeaker:
             wav = self._wav_q.get()
             if wav is None:
                 return
+            if self.first_play_ts is None:
+                self.first_play_ts = time.monotonic()
             try:
                 audio.play_audio(wav)
             except Exception as e:

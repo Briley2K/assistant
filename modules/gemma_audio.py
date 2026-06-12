@@ -57,3 +57,10 @@ def audio_part(wav_bytes: bytes) -> dict:
         "type": "input_audio",
         "input_audio": {"data": base64.b64encode(wav_bytes).decode(), "format": "wav"},
     }
+
+
+def image_part(image_bytes: bytes, fmt: str = "png") -> dict:
+    """Wrap image bytes as an image_url content part (handled by the base Gemma4
+    vision handler — the mmproj is audio+vision)."""
+    b64 = base64.b64encode(image_bytes).decode()
+    return {"type": "image_url", "image_url": {"url": f"data:image/{fmt};base64,{b64}"}}

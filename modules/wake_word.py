@@ -91,11 +91,93 @@ def _train() -> None:
                               or phrases.similarity(heard, phrase) >= 0.6):
                     variants.add(heard)
 
-    _variants = sorted(variants)
+    _save_variants(variants)
+    print(f"[Wake word] Trained — accepting {len(_variants)} variants: {_variants}")
+
+
+def _save_variants(variants) -> list[str]:
+    """Persist the accepted-transcript set for the current phrase and refresh the
+    in-memory cache. Accepts any iterable; stores a sorted, de-duplicated list."""
+    global _variants
+    _variants = sorted(set(variants))
     os.makedirs(os.path.dirname(config.WAKE_VARIANTS_PATH), exist_ok=True)
     with open(config.WAKE_VARIANTS_PATH, "w") as f:
-        json.dump({"phrase": phrase, "variants": _variants}, f, indent=2)
-    print(f"[Wake word] Trained — accepting {len(_variants)} variants: {_variants}")
+        json.dump({"phrase": config.WAKE_PHRASE, "variants": _variants}, f, indent=2)
+    return _variants
+
+
+def _accepts_sample(heard: str) -> bool:
+    """True if a transcript plausibly IS the wake phrase — used to reject a
+    sample captured from background noise or a misfire, so garbage never becomes
+    an accepted wake variant. More lenient than detection (the user is genuinely
+    saying the phrase here), but still guards against unrelated transcripts."""
+    norm = phrases.normalize(heard)
+    if not norm:
+        return False
+    return (phrases.contains(heard, config.WAKE_PHRASE)
+            or _windowed_similarity(heard, config.WAKE_PHRASE) >= 0.5)
+
+
+def enroll_voice(num_samples: int = 5, recorder=None, on_event=None) -> dict:
+    """Interactively learn the user's own pronunciation of the wake phrase.
+
+    Records the user saying the phrase `num_samples` times, transcribes each with
+    the spotter Whisper, and merges the accepted transcripts into the phrase's
+    variant set (on top of any existing synthetic/learned variants) so detection
+    adapts to this speaker. Bundled openWakeWord phrases can't be voice-trained
+    this way (they use a fixed neural model) — returns an error in that case.
+
+    `recorder()` -> wav bytes is injectable (defaults to one silence-bounded mic
+    capture); `on_event(name, data)` receives progress events for the UI/voice
+    front-end. Returns a summary dict: {ok, accepted, attempts, variants, samples}."""
+    from modules import audio, stt
+
+    def emit(name, **data):
+        if on_event:
+            on_event(name, data)
+
+    if config.WAKE_WORD_MODEL:        # bundled phrase → neural model, not transcript-based
+        emit("unsupported", phrase=config.WAKE_PHRASE)
+        return {"ok": False, "error": "voice enrollment only applies to custom wake "
+                "phrases; this phrase uses a pretrained model. Adjust the detection "
+                "threshold instead."}
+
+    stt.warmup_spotter()
+    record = recorder or (lambda: audio.record_until_silence())
+
+    existing = set(_load_variants() or [])
+    existing.add(phrases.normalize(config.WAKE_PHRASE))
+    learned: list[str] = []
+    emit("intro", phrase=config.WAKE_PHRASE, num_samples=num_samples)
+
+    accepted = attempts = 0
+    max_attempts = num_samples * 2        # allow re-tries for misfires/silence
+    while accepted < num_samples and attempts < max_attempts:
+        attempts += 1
+        emit("prompt", index=accepted + 1, total=num_samples, attempt=attempts)
+        wav = record()
+        if not audio.last_stats.get("triggered"):
+            emit("no_speech", index=accepted + 1)
+            continue
+        heard = stt.transcribe_spotter(wav)
+        if _accepts_sample(heard):
+            norm = phrases.normalize(heard)
+            accepted += 1
+            if norm not in existing:
+                learned.append(norm)
+            emit("accepted", index=accepted, total=num_samples, heard=norm)
+        else:
+            emit("rejected", heard=phrases.normalize(heard))
+
+    if accepted == 0:
+        emit("failed", attempts=attempts)
+        return {"ok": False, "error": "no usable samples captured", "attempts": attempts}
+
+    variants = _save_variants(existing | set(learned))
+    summary = {"ok": True, "accepted": accepted, "attempts": attempts,
+               "variants": variants, "samples": learned}
+    emit("done", **summary)
+    return summary
 
 
 def _windowed_similarity(heard: str, target: str) -> float:

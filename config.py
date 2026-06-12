@@ -55,20 +55,32 @@ LLM_MODELS = {
         "ollama": "gemma4-12b",
         "gguf":   "gemma-4-12B-it-Q4_K_M.gguf",
         "mmproj": "mmproj-gemma-4-12B-it-BF16.gguf",   # audio+vision
+        "hf_repo": "lmstudio-community/gemma-4-12B-it-GGUF",
         "dirs":   [
             os.path.join(_BASE, "models", "gemma"),
             ("/run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/"
              "lmstudio-community/gemma-4-12B-it-GGUF"),
         ],
     },
-    "nemotron-nano-30b": {
-        "label":  "NVIDIA Nemotron Nano 3 30B (Ollama · text-only)",
-        # NOTE: verify this tag matches what `ollama list` shows. Pull it first:
-        #       ollama pull nemotron-3-nano-30b
-        # Adjust the tag here, or override it in the control panel's Ollama field.
-        "ollama": "nemotron-3-nano-30b",
-        "gguf":   "nemotron-3-nano-30b-Q4_K_M.gguf",
-        "mmproj": None,            # text-only — no native audio, uses Whisper
+    "nemotron-3-nano-omni-30b": {
+        "label":  "NVIDIA Nemotron 3 Nano Omni 30B-A3B",
+        # Multimodal MoE (30B total / ~3B active). Run options:
+        #   • Ollama (text-only):  ollama pull nemotron-3-nano:30b
+        #   • Local GGUF (llama-cpp), repo:
+        #     unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF
+        #   • Remote API (OpenRouter, OpenAI-compatible), set the API backend to:
+        #     base_url https://openrouter.ai/api/v1
+        #     model    nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+        # mmproj is left None: the native-audio handler is Gemma-specific, so this
+        # model runs text-only here (Whisper STT) regardless of backend.
+        "ollama": "nemotron-3-nano:30b",
+        # UD-IQ4_XS (~19.5GB) is the best-quality quant that fits ~22GB of RAM
+        # (after Gemma unloads) on this 30GB CPU box. For a 24GB+ GPU use
+        # UD-Q4_K_XL (23.9GB); to save RAM, UD-Q2_K_XL (18.5GB). Whatever you set
+        # here is the file the Download button fetches and the loader expects.
+        "gguf":   "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ4_XS.gguf",
+        "mmproj": None,
+        "hf_repo": "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF",
         "dirs":   [os.path.join(_BASE, "models", "nemotron")],
     },
 }
@@ -121,6 +133,13 @@ CONTEXT_TURNS    = 10       # max conversation turns to keep in memory
 # "gpu" (force full GPU offload), or "cpu". "auto" is the default.
 LLM_DEVICE = _S.get("llm_device", "auto")
 
+# Partial GPU offload: how many of the model's layers to place on the GPU (the
+# rest run on CPU + RAM). For big models that don't fully fit in VRAM — e.g.
+# Nemotron 30B on a 16GB card — put as many layers on the GPU as fit and the
+# rest on the CPU. Accepts: "" / "auto" (follow LLM_DEVICE), "all", "none", or a
+# number like 24. When set to a number/all/none it OVERRIDES LLM_DEVICE.
+LLM_GPU_LAYERS = str(_S.get("llm_gpu_layers", "")).strip().lower()
+
 # Cap on the share of GPU *compute* (SMs) Cleo may use, 10-100. 100 = no limit.
 # Enforced via NVIDIA MPS (modules/gpu.py); does not affect VRAM. Applied at
 # startup, so a change takes effect on the next assistant restart.
@@ -161,7 +180,18 @@ def _llm_vram_need_mb() -> int:
 
 
 def _resolve_gpu_layers() -> int:
-    """Layers to offload to GPU: -1 = all, 0 = none (CPU). Honors LLM_DEVICE."""
+    """Layers to offload to GPU: -1 = all, 0 = none (CPU), N = first N layers.
+    An explicit LLM_GPU_LAYERS wins; otherwise honor LLM_DEVICE."""
+    # Explicit partial-offload override.
+    if LLM_GPU_LAYERS not in ("", "auto"):
+        if LLM_GPU_LAYERS in ("all", "max", "gpu"):
+            return -1
+        if LLM_GPU_LAYERS in ("none", "cpu", "0"):
+            return 0
+        try:
+            return max(0, int(LLM_GPU_LAYERS))
+        except ValueError:
+            pass                            # malformed → fall through to device
     if LLM_DEVICE == "cpu":
         return 0
     if LLM_DEVICE == "gpu":
@@ -172,7 +202,7 @@ def _resolve_gpu_layers() -> int:
     return -1 if free >= _llm_vram_need_mb() else 0
 
 
-# llama-cpp only: number of model layers to put on the GPU (-1 all, 0 CPU).
+# llama-cpp only: number of model layers to put on the GPU (-1 all, 0 CPU, N=partial).
 LLM_N_GPU_LAYERS = _resolve_gpu_layers()
 
 SYSTEM_PROMPT = _S.get(
@@ -258,7 +288,45 @@ WHISPER_COMPUTE  = "float16" # "int8" on CPU fallback
 WHISPER_LANGUAGE = "en"      # None for auto-detect
 
 # --- Text-to-speech ---
-TTS_ENGINE = _S.get("tts_engine", "kokoro")   # "kokoro" (natural) | "piper" (fast/robotic)
+# "kokoro" (natural) | "piper" (fast/robotic) | "neutts" (NeuTTS Air, voice-cloning,
+# runs in the isolated neutts_test venv via a helper — see modules/neutts_tts.py).
+TTS_ENGINE = _S.get("tts_engine", "kokoro")
+
+# NeuTTS Air (on-device voice cloning). The model runs in neutts_test/.venv
+# (Python 3.12 + torch); the main app talks to a localhost helper it spawns.
+_NEUTTS_DIR     = os.path.join(_BASE, "neutts_test")
+NEUTTS_PYTHON   = os.path.join(_NEUTTS_DIR, ".venv", "bin", "python")
+NEUTTS_SERVER   = os.path.join(_NEUTTS_DIR, "neutts_server.py")
+_NEUTTS_SAMPLES = os.path.join(_NEUTTS_DIR, "samples")
+NEUTTS_PORT     = int(_S.get("neutts_port", 5008))
+# q4 (fast) or q8 (higher quality) GGUF backbone.
+NEUTTS_BACKBONE = _S.get("neutts_backbone", "neuphonic/neutts-air-q4-gguf")
+# Reference voice to clone: a name in neutts_test/samples (jo=female EN default,
+# dave=male EN, …) or an absolute path to a custom <name>.wav (+ <name>.txt).
+NEUTTS_VOICE    = _S.get("neutts_voice", "jo")
+
+
+def neutts_ref_paths() -> tuple[str, str]:
+    """(wav, txt) for the configured NeuTTS reference voice. A bare name maps to
+    neutts_test/samples/<name>.{wav,txt}; an absolute .wav path is used as-is
+    (its transcript is the sibling .txt)."""
+    v = NEUTTS_VOICE
+    if os.path.isabs(v):
+        wav = v if v.endswith(".wav") else v + ".wav"
+        return wav, os.path.splitext(wav)[0] + ".txt"
+    return (os.path.join(_NEUTTS_SAMPLES, f"{v}.wav"),
+            os.path.join(_NEUTTS_SAMPLES, f"{v}.txt"))
+
+
+def neutts_voices() -> list[str]:
+    """Bundled reference-voice names available in neutts_test/samples."""
+    try:
+        return sorted(f[:-4] for f in os.listdir(_NEUTTS_SAMPLES)
+                      if f.endswith(".wav")
+                      and os.path.exists(os.path.join(_NEUTTS_SAMPLES, f[:-4] + ".txt")))
+    except OSError:
+        return ["jo"]
+
 
 # Piper
 PIPER_VOICE   = os.path.join(_BASE, "models", "piper", "en_US-lessac-medium.onnx")

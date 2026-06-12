@@ -7,8 +7,10 @@ edit the pre-prompt, choose the wake word, and manage the LLM / remote-API
 connection. All settings are persisted to settings.json, which config.py reads.
 """
 import os
+import sys
 import time
 import json
+import threading
 import subprocess
 
 from flask import Flask, request, redirect, url_for, render_template_string
@@ -25,7 +27,19 @@ WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 BACKENDS = ["auto", "ollama", "llamacpp", "api"]
 LLM_DEVICES = ["auto", "gpu", "cpu"]
 STT_MODES = ["native", "whisper"]
-TTS_ENGINES = ["kokoro", "piper"]
+TTS_ENGINES = ["kokoro", "piper", "neutts"]
+NEUTTS_BACKBONES = ["neuphonic/neutts-air-q4-gguf", "neuphonic/neutts-air-q8-gguf"]
+
+
+def neutts_voice_names():
+    """Bundled NeuTTS reference-voice names, from config (or a default)."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        return config.neutts_voices()
+    except Exception:
+        return ["jo"]
 
 
 def skill_list():
@@ -48,6 +62,29 @@ def llm_models():
         return [(k, v["label"]) for k, v in config.LLM_MODELS.items()]
     except Exception:
         return [("gemma4-12b", "Gemma 4 12B")]
+
+
+def model_status(s: dict) -> dict:
+    """Whether the selected model's local GGUF is present / downloading, read
+    from live settings + the static registry (not cached config state)."""
+    info = {"key": s.get("llm_model", "gemma4-12b"), "present": False,
+            "size_gb": None, "downloading": False, "downloadable": False, "label": ""}
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        m = config.LLM_MODELS.get(info["key"]) or config.LLM_MODELS["gemma4-12b"]
+        info["label"] = m.get("label", info["key"])
+        info["downloadable"] = bool(m.get("hf_repo"))
+        found = next((os.path.join(d, m["gguf"]) for d in m["dirs"]
+                      if os.path.exists(os.path.join(d, m["gguf"]))), None)
+        info["present"] = found is not None
+        if found:
+            info["size_gb"] = round(os.path.getsize(found) / 1e9, 1)
+        info["downloading"] = os.path.exists(os.path.join(m["dirs"][0], ".downloading"))
+    except Exception:
+        pass
+    return info
 
 
 def kokoro_voice_names():
@@ -109,10 +146,13 @@ def index():
         whisper_models=WHISPER_MODELS,
         backends=BACKENDS,
         llm_models=llm_models(),
+        model_status=model_status(load_settings()),
         llm_devices=LLM_DEVICES,
         stt_modes=STT_MODES,
         tts_engines=TTS_ENGINES,
         kokoro_voices=kokoro_voice_names(),
+        neutts_voices=neutts_voice_names(),
+        neutts_backbones=NEUTTS_BACKBONES,
         skills=skill_list(),
         disabled=set(load_settings().get("skills_disabled", [])),
         msg=request.args.get("msg", ""),
@@ -127,6 +167,8 @@ def save():
     s["stt_mode"]            = f.get("stt_mode", "native")
     s["tts_engine"]          = f.get("tts_engine", "kokoro")
     s["kokoro_voice"]        = f.get("kokoro_voice", "af_heart")
+    s["neutts_voice"]        = f.get("neutts_voice", "jo")
+    s["neutts_backbone"]     = f.get("neutts_backbone", "neuphonic/neutts-air-q4-gguf")
     s["kokoro_speed"]        = float(f.get("kokoro_speed", 1.0))
     try:
         s["tts_volume"]      = max(0.0, min(1.0, int(f.get("tts_volume", 100)) / 100.0))
@@ -147,6 +189,7 @@ def save():
     s["side_panel"]          = bool(f.get("side_panel"))
     s["llm_backend"]         = f.get("llm_backend", "auto")
     s["llm_device"]          = f.get("llm_device", "auto")
+    s["llm_gpu_layers"]      = f.get("llm_gpu_layers", "").strip()
     try:
         s["gpu_compute_percent"] = max(10, min(100, int(f.get("gpu_compute_percent", 100))))
     except (TypeError, ValueError):
@@ -185,13 +228,21 @@ def test_voice():
     import sys
     sys.path.insert(0, BASE)
     f = request.form
-    engine, voice = f.get("tts_engine", "kokoro"), f.get("kokoro_voice", "af_heart")
+    engine = f.get("tts_engine", "kokoro")
     sample = "Hello, this is a preview of the selected voice."
     try:
         from modules import audio
+        label = engine
         if engine == "kokoro":
             from modules import kokoro_tts
+            voice = f.get("kokoro_voice", "af_heart")
             wav = kokoro_tts.synth_wav(sample, voice=voice)
+            label = f"kokoro: {voice}"
+        elif engine == "neutts":
+            from modules import neutts_tts
+            voice = f.get("neutts_voice", "jo")
+            wav = neutts_tts.synth_wav(sample, voice=voice)   # first call may load the model (~15-30s)
+            label = f"neutts: {voice}"
         else:
             import io, wave
             from modules import tts
@@ -200,10 +251,42 @@ def test_voice():
                 tts._get_voice().synthesize_wav(sample, wf)
             wav = buf.getvalue()
         audio.play_audio(wav)
-        msg = f"Played sample ({engine}{': ' + voice if engine == 'kokoro' else ''})."
+        msg = f"Played sample ({label})."
     except Exception as e:
         msg = f"Voice test failed: {e}"
     return redirect(url_for("index", msg=msg))
+
+
+@app.route("/neutts_upload", methods=["POST"])
+def neutts_upload():
+    """Add a custom NeuTTS reference voice: save the uploaded WAV under
+    neutts_test/samples/<name>.wav and auto-transcribe it (Whisper) to the
+    matching .txt, so it appears in the NeuTTS voice dropdown."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+
+    f = request.files.get("ref_audio")
+    raw = (request.form.get("ref_name") or "").strip().lower()
+    name = "".join(c for c in raw.replace(" ", "_") if c.isalnum() or c in "_-")
+    if not f or not name:
+        return jsonify({"error": "Need an audio file and a name."}), 400
+
+    data = f.read()
+    samples = os.path.join(BASE, "neutts_test", "samples")
+    os.makedirs(samples, exist_ok=True)
+    try:
+        from modules import stt
+        stt._wav_bytes_to_float32(data)          # validates it's a decodable WAV
+        transcript = stt.transcribe(data).strip()
+    except Exception as e:
+        return jsonify({"error": f"Couldn't read/transcribe — use a clean mono WAV. ({e})"}), 400
+
+    with open(os.path.join(samples, f"{name}.wav"), "wb") as out:
+        out.write(data)
+    with open(os.path.join(samples, f"{name}.txt"), "w") as out:
+        out.write(transcript or "This is a reference voice sample.")
+    return jsonify({"ok": True, "name": name, "transcript": transcript})
 
 
 @app.route("/control", methods=["POST"])
@@ -221,6 +304,31 @@ def control():
     code, out = systemctl(*actions[action])
     msg = f"'{action}' ok." if code == 0 else f"'{action}' failed: {out or 'no systemd user session'}"
     return redirect(url_for("index", msg=msg))
+
+
+@app.route("/download_model", methods=["POST"])
+def download_model():
+    """Start downloading the selected model's GGUF in the background (detached),
+    streaming progress to logs/model_download.log. The page shows a 'downloading'
+    status (driven by the .downloading sentinel) until it finishes."""
+    import sys
+    # Use the model currently chosen in the dropdown (the form submits with this
+    # button), so Download works even before the selection has been saved.
+    key = request.form.get("llm_model") or load_settings().get("llm_model", "gemma4-12b")
+    script = os.path.join(BASE, "download_model.py")
+    log = os.path.join(BASE, "logs", "model_download.log")
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        lf = open(log, "w")
+        subprocess.Popen(
+            [sys.executable, script, key],
+            stdout=lf, stderr=lf, start_new_session=True,
+        )
+    except OSError as e:
+        return redirect(url_for("index", msg=f"Couldn't start download: {e}"))
+    return redirect(url_for("index", msg=(
+        f"Downloading '{key}' in the background — this can take a while (several GB). "
+        "Watch logs/model_download.log; the Model section shows when it's ready.")))
 
 
 @app.route("/restart_panel", methods=["POST"])
@@ -340,7 +448,159 @@ def chat_clear():
         open(CHATLOG_PATH, "w").close()
     except OSError:
         pass
+    try:                                  # also drop any queued typed messages
+        import sys
+        sys.path.insert(0, BASE)
+        from modules import textq
+        textq.clear()
+    except Exception:
+        pass
     return ("", 204)
+
+
+@app.route("/chat/send", methods=["POST"])
+def chat_send():
+    """Hand a typed message to the running assistant, which answers it through
+    its normal pipeline (reusing the already-loaded model — no second copy). We
+    log the user turn here so it shows instantly, then queue the text; the
+    assistant streams the reply into the live view and logs it when done."""
+    from flask import jsonify
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Empty message."}), 400
+
+    import sys
+    sys.path.insert(0, BASE)
+    try:
+        from modules import chatlog, textq
+    except Exception as e:
+        return jsonify({"error": f"Could not load the assistant modules: {e}"}), 500
+
+    chatlog.log("user", text)
+    textq.send(text)
+
+    # Best-effort heads-up if the assistant clearly isn't running to answer it.
+    note = None
+    st = service_state()
+    if st["installed"] and st["active"] != "active":
+        note = ("The assistant service isn't running, so this won't be answered "
+                "until you Start it from the panel.")
+    return jsonify({"queued": True, "note": note})
+
+
+# --------------------------------------------------------------------------
+# Wake-word voice enrollment (interactive — runs in this process so it can use
+# the mic/speakers; the assistant service is paused during it to free the mic).
+# --------------------------------------------------------------------------
+_enroll = {"running": False, "phase": "idle", "prompt": "",
+           "log": [], "summary": None, "error": None}
+_enroll_lock = threading.Lock()
+
+
+def _enroll_set(**fields) -> None:
+    with _enroll_lock:
+        _enroll.update(fields)
+
+
+def _enroll_log(kind: str, text: str) -> None:
+    with _enroll_lock:
+        _enroll["log"].append({"kind": kind, "text": text})
+
+
+def _enroll_event(name: str, data: dict) -> None:
+    """Map enroll_voice() progress events into the shared state the browser polls,
+    and speak the user-facing prompts aloud so the user knows when to talk."""
+    from modules import tts
+    phrase = data.get("phrase", "")
+    speak = None
+    if name == "intro":
+        speak = (f"Let's teach me your voice. When I prompt you, say your wake "
+                 f"phrase. We'll do this {data['num_samples']} times.")
+        _enroll_set(phase="recording", prompt=speak)
+    elif name == "prompt":
+        speak = f"Say it now. Number {data['index']} of {data['total']}."
+        _enroll_set(phase="recording",
+                    prompt=f"🎤 Say your wake phrase now — {data['index']} of {data['total']}")
+    elif name == "accepted":
+        _enroll_log("ok", f"✓ heard “{data['heard']}”  ({data['index']}/{data['total']})")
+    elif name == "rejected":
+        speak = "Hmm, that didn't sound right. Let's try again."
+        _enroll_log("bad", f"✗ didn't catch that (“{data['heard']}”) — retrying")
+    elif name == "no_speech":
+        speak = "I didn't hear anything. Let's try again."
+        _enroll_log("bad", "✗ no speech detected — retrying")
+    elif name == "unsupported":
+        _enroll_set(prompt="This phrase uses a built-in model — nothing to train.")
+    elif name == "failed":
+        _enroll_log("bad", "No usable samples captured.")
+    elif name == "done":
+        n = len(data.get("samples") or [])
+        msg = (f"Learned {n} new pronunciation(s) from your voice."
+               if n else "Your voice already matched — no new variants needed.")
+        _enroll_log("ok", msg)
+    if speak:
+        try:
+            tts.speak(speak)
+        except Exception:
+            pass
+
+
+def _enroll_worker(num_samples: int) -> None:
+    restart = False
+    try:
+        sys.path.insert(0, BASE)
+        st = service_state()
+        if st["installed"] and st["active"] == "active":
+            _enroll_set(phase="preparing",
+                        prompt="Pausing the assistant so it doesn't grab the mic…")
+            systemctl("stop", SERVICE)
+            restart = True
+            time.sleep(1.5)            # let it release the mic/audio device
+
+        _enroll_set(phase="preparing", prompt="Loading speech models…")
+        from modules import tts, wake_word
+        tts.warmup()
+        summary = wake_word.enroll_voice(num_samples=num_samples, on_event=_enroll_event)
+        if summary.get("ok"):
+            _enroll_set(phase="done", summary=summary,
+                        prompt="All set — I've learned how you say it.")
+        else:
+            _enroll_set(phase="error", error=summary.get("error", "enrollment failed"),
+                        prompt=summary.get("error", "Enrollment failed."))
+    except Exception as e:
+        _enroll_set(phase="error", error=str(e), prompt=f"Enrollment failed: {e}")
+        _enroll_log("bad", str(e))
+    finally:
+        if restart:
+            systemctl("start", SERVICE)
+            _enroll_log("ok", "Restarted the assistant.")
+        with _enroll_lock:
+            _enroll["running"] = False
+
+
+@app.route("/wake/enroll/start", methods=["POST"])
+def wake_enroll_start():
+    from flask import jsonify
+    with _enroll_lock:
+        if _enroll["running"]:
+            return jsonify({"error": "Enrollment already in progress."}), 409
+        try:
+            num = max(1, min(20, int((request.get_json(silent=True) or {}).get("samples", 5))))
+        except (TypeError, ValueError):
+            num = 5
+        _enroll.update(running=True, phase="preparing", prompt="Starting…",
+                       log=[], summary=None, error=None)
+    threading.Thread(target=_enroll_worker, args=(num,), daemon=True,
+                     name="wake-enroll").start()
+    return jsonify({"started": True, "samples": num})
+
+
+@app.route("/wake/enroll/status")
+def wake_enroll_status():
+    from flask import jsonify
+    with _enroll_lock:
+        return jsonify(dict(_enroll))
 
 
 PAGE = """<!doctype html>
@@ -436,6 +696,27 @@ PAGE = """<!doctype html>
      (re)starts (~30 s), and it announces when the wake word is ready.
      These have pretrained instant models: {{ bundled_wake_words|join(', ') }}
      (threshold applies to those only).</p>
+
+  <div style="border-top:1px solid #2c313c; margin-top:1rem; padding-top:.8rem">
+    <label style="margin-top:0">Train the wake word to your voice</label>
+    <div class="row" style="align-items:flex-end">
+      <div style="max-width:9rem">
+        <label style="margin-top:0">Samples</label>
+        <input type="number" id="enrollSamples" value="5" min="1" max="20" step="1">
+      </div>
+      <div style="flex:0 0 auto">
+        <button type="button" id="enrollBtn" onclick="startEnroll()">🎤 Train to my voice</button>
+      </div>
+    </div>
+    <div id="enrollStatus" class="hint" style="display:none; margin-top:.6rem;
+         background:#11131a; border:1px solid #2c313c; border-radius:8px; padding:.7rem .9rem">
+      <div id="enrollPrompt" style="font-size:1rem; color:#e6e6e6"></div>
+      <div id="enrollLog" style="margin-top:.4rem; font-family:ui-monospace,monospace; font-size:.8rem"></div>
+    </div>
+    <p class="hint">Cleo will ask you to say your wake phrase a few times and learn how
+       your voice is heard. The assistant is paused during training (to free the mic)
+       and restarted after. Only for custom phrases — say each prompt in a quiet spot.</p>
+  </div>
 </div>
 
 <div class="card">
@@ -481,10 +762,8 @@ PAGE = """<!doctype html>
      monitor via the GNOME screen-share portal and looks at it. You grant access once below;
      after that, captures are silent.</p>
   <div class="btns">
-    <form method="post" action="/screen_grant" style="display:inline">
-      <button type="submit" class="secondary"
-              title="Pop the GNOME share dialog to (re)grant screen access">🖥️ Set up / re-grant screen access</button>
-    </form>
+    <button type="submit" formaction="/screen_grant" class="secondary"
+            title="Pop the GNOME share dialog to (re)grant screen access">🖥️ Set up / re-grant screen access</button>
   </div>
   <p class="hint">Click this, then in the GNOME dialog pick <b>Entire screen</b> (or ctrl-click all
      monitors) so Cleo can view any of them by voice. Picking a single monitor limits it to that one.</p>
@@ -513,15 +792,14 @@ PAGE = """<!doctype html>
 
 <div class="card">
   <h2 style="margin-top:0">Voice (text-to-speech)</h2>
-  <div class="row">
-    <div>
-      <label>Engine</label>
-      <select name="tts_engine">
-        {% for e in tts_engines %}
-        <option value="{{ e }}" {{ 'selected' if s.tts_engine==e else '' }}>{{ e }}</option>
-        {% endfor %}
-      </select>
-    </div>
+  <label>Engine</label>
+  <select name="tts_engine" id="ttsEngine" onchange="updateVoiceOpts()">
+    {% for e in tts_engines %}
+    <option value="{{ e }}" {{ 'selected' if s.tts_engine==e else '' }}>{{ e }}</option>
+    {% endfor %}
+  </select>
+
+  <div class="row" id="kokoroOpts">
     <div>
       <label>Kokoro voice</label>
       <select name="kokoro_voice">
@@ -536,6 +814,66 @@ PAGE = """<!doctype html>
              value="{{ s.kokoro_speed or 1.0 }}">
     </div>
   </div>
+
+  <div class="row" id="neuttsOpts">
+    <div>
+      <label>NeuTTS voice (cloned reference)</label>
+      <select name="neutts_voice">
+        {% for v in neutts_voices %}
+        <option value="{{ v }}" {{ 'selected' if (s.neutts_voice or 'jo')==v else '' }}>{{ v }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label>NeuTTS model</label>
+      <select name="neutts_backbone">
+        {% for b in neutts_backbones %}
+        <option value="{{ b }}" {{ 'selected' if (s.neutts_backbone or neutts_backbones[0])==b else '' }}>
+          {{ 'q4 (fast)' if 'q4' in b else 'q8 (higher quality)' }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  <div id="neuttsUpload">
+    <p class="hint">NeuTTS Air <b>clones the reference voice</b> you give it — quality depends entirely on
+       the clip. The bundled <b>jo</b>/<b>dave</b> are casual samples. For a great voice, upload a clean
+       <b>mono WAV, ~5–15s</b>, of the voice you want (calm, clear, no music/noise). It's auto-transcribed
+       and added to the voice list above. Try the <b>q8</b> model for higher quality. Applies on the next restart.</p>
+    <div class="row">
+      <div><label>New voice name</label><input type="text" id="refName" placeholder="e.g. sophon"></div>
+      <div><label>Reference WAV</label><input type="file" id="refFile" accept=".wav,audio/wav"></div>
+      <div style="display:flex; align-items:flex-end;">
+        <button type="button" class="secondary" onclick="uploadRef()">⬆ Upload &amp; transcribe</button></div>
+    </div>
+    <p class="hint" id="refMsg"></p>
+  </div>
+  <script>
+    function updateVoiceOpts(){
+      var e = document.getElementById('ttsEngine').value;
+      var k = document.getElementById('kokoroOpts');
+      var n = document.getElementById('neuttsOpts');
+      var u = document.getElementById('neuttsUpload');
+      if (k) k.style.display = (e === 'kokoro') ? '' : 'none';
+      if (n) n.style.display = (e === 'neutts') ? '' : 'none';
+      if (u) u.style.display = (e === 'neutts') ? '' : 'none';
+    }
+    async function uploadRef(){
+      var name = document.getElementById('refName').value.trim();
+      var file = document.getElementById('refFile').files[0];
+      var msg = document.getElementById('refMsg');
+      if (!name || !file){ msg.textContent = 'Enter a name and choose a WAV file.'; return; }
+      msg.textContent = 'Uploading & transcribing (Whisper)… this can take a moment.';
+      var fd = new FormData(); fd.append('ref_name', name); fd.append('ref_audio', file);
+      try {
+        var r = await fetch('/neutts_upload', {method:'POST', body: fd});
+        var d = await r.json();
+        if (!r.ok){ msg.textContent = d.error || 'Upload failed.'; return; }
+        msg.textContent = 'Added "' + d.name + '". Transcript: “' + d.transcript + '” — reloading…';
+        setTimeout(function(){ location.reload(); }, 1500);
+      } catch(e){ msg.textContent = 'Upload failed: ' + e; }
+    }
+    updateVoiceOpts();
+  </script>
   {% set vol_pct = (s.get('tts_volume', 1.0) * 100) | round | int %}
   <label>Volume: <b id="volLabel">{{ vol_pct }}%</b></label>
   <input type="range" name="tts_volume" min="0" max="100" step="5" value="{{ vol_pct }}"
@@ -582,9 +920,22 @@ PAGE = """<!doctype html>
     {% endfor %}
   </select>
   <p class="hint">Picks which model to run. Text-only models (e.g. Nemotron) automatically use
-     Whisper for speech — native audio needs an audio-capable model like Gemma 4.
-     Nemotron runs via Ollama: <code>ollama pull nemotron-3-nano-30b</code> first, and make sure
-     the tag matches the Ollama field below (blank = the model's default tag).</p>
+     Whisper for speech — native audio needs an audio-capable model like Gemma 4.</p>
+  <div class="hint" style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap;">
+    {% if model_status.present %}
+      <span class="pill on">local file ready{% if model_status.size_gb %} · {{ model_status.size_gb }} GB{% endif %}</span>
+    {% elif model_status.downloading %}
+      <span class="pill" style="background:#3a3320;color:#e3c878">⬇ downloading… (see logs/model_download.log)</span>
+    {% else %}
+      <span class="pill off">no local file</span>
+    {% endif %}
+    {% if model_status.downloadable and not model_status.present and not model_status.downloading %}
+      <button type="submit" formaction="/download_model" class="secondary"
+              title="Download this model's GGUF from HuggingFace (several GB)">⬇ Download model</button>
+    {% endif %}
+  </div>
+  <p class="hint">A local file is only needed for the <b>llama-cpp</b> backend. For Ollama use
+     <code>ollama pull</code>; for a remote model use the API backend below — neither needs a download.</p>
   <label>Backend</label>
   <select name="llm_backend">
     {% for b in backends %}
@@ -600,6 +951,14 @@ PAGE = """<!doctype html>
   </select>
   <p class="hint">auto = GPU if it has enough free VRAM for the model, otherwise CPU + RAM.
      gpu / cpu force one. (Needs a CUDA-enabled llama-cpp build for GPU — see enable_gpu_llm.sh.)</p>
+  <label>GPU layers (partial offload)</label>
+  <input name="llm_gpu_layers" placeholder="auto"
+         value="{{ s.llm_gpu_layers or '' }}">
+  <p class="hint">How many of the model's layers to put on the GPU; the rest run on the CPU.
+     For big models that don't fit in VRAM (e.g. Nemotron 30B on a 16&nbsp;GB card), set a number
+     like <code>20</code> — raise it until VRAM is nearly full, lower it if you hit out-of-memory.
+     <code>auto</code> (blank) follows the Device setting; <code>all</code> = whole model on GPU,
+     <code>none</code> = CPU only. Overrides Device when set. Applies on the next assistant restart.</p>
   <label>GPU compute limit: <b id="gpuPctLabel">{{ (s.gpu_compute_percent or 100) }}%</b></label>
   <input type="range" name="gpu_compute_percent" min="10" max="100" step="5"
          value="{{ s.gpu_compute_percent or 100 }}"
@@ -630,6 +989,44 @@ PAGE = """<!doctype html>
   <button type="submit" name="restart" value="1" class="secondary">Save &amp; restart assistant</button>
 </div>
 </form>
+
+<script>
+// --- Wake-word voice enrollment ---
+let enrolling = false;
+async function startEnroll(){
+  if (enrolling) return;
+  const btn = document.getElementById('enrollBtn');
+  const samples = parseInt(document.getElementById('enrollSamples').value) || 5;
+  const box = document.getElementById('enrollStatus');
+  const promptEl = document.getElementById('enrollPrompt');
+  const logEl = document.getElementById('enrollLog');
+  box.style.display = 'block'; logEl.innerHTML = '';
+  promptEl.textContent = 'Starting…';
+  try {
+    const r = await fetch('/wake/enroll/start', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({samples})});
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok){ promptEl.textContent = d.error || 'Could not start.'; return; }
+  } catch(e){ promptEl.textContent = 'Could not start: ' + e; return; }
+  enrolling = true; btn.disabled = true; btn.textContent = 'Training…';
+  pollEnroll();
+}
+async function pollEnroll(){
+  const btn = document.getElementById('enrollBtn');
+  const promptEl = document.getElementById('enrollPrompt');
+  const logEl = document.getElementById('enrollLog');
+  try {
+    const r = await fetch('/wake/enroll/status');
+    const s = await r.json();
+    promptEl.textContent = s.prompt || '';
+    logEl.innerHTML = (s.log||[]).map(l =>
+      '<div style="color:'+(l.kind==='ok'?'#7fd17f':l.kind==='bad'?'#e08f8f':'#aab')+'">'
+      + l.text.replace(/</g,'&lt;') + '</div>').join('');
+    if (s.running){ setTimeout(pollEnroll, 600); return; }
+  } catch(e){ promptEl.textContent = 'Lost contact with the panel: ' + e; }
+  enrolling = false; btn.disabled = false; btn.textContent = '🎤 Train to my voice';
+}
+</script>
 </body></html>"""
 
 
@@ -666,13 +1063,29 @@ CHAT_PAGE = """<!doctype html>
   .summary h2 { font-size:.8rem; margin:0 0 .4rem; color:#9ecbff; }
   .summary .grid { display:flex; gap:1.4rem; flex-wrap:wrap; }
   .summary b { color:#e6e6e6; font-size:1rem; display:block; }
+  #composer { position:fixed; left:0; right:0; bottom:0; background:#15171c;
+              border-top:1px solid #2c313c; padding:.6rem 1rem; }
+  #composer .inner { max-width:760px; margin:0 auto; display:flex; gap:.5rem; }
+  #msg { flex:1; background:#11131a; color:#e6e6e6; border:1px solid #333a47;
+         border-radius:8px; padding:.6rem .75rem; font-size:.92rem; }
+  #msg:focus { outline:none; border-color:#3b7cf0; }
+  #sendbtn { background:#2d6cdf; padding:.55rem 1.1rem; }
+  #sendbtn:hover { background:#3b7cf0; filter:none; }
+  #sendbtn:disabled { opacity:.5; cursor:default; }
 </style></head><body>
 <header>
   <h1>💬 Conversation</h1>
   <span class="dot" id="live"></span>
   <button onclick="clearChat()">Clear</button>
 </header>
-<div id="log"><p class="empty">No conversation yet. Say the wake word to start talking.</p></div>
+<div id="log"><p class="empty">No conversation yet. Say the wake word or type a message below to start.</p></div>
+
+<form id="composer" onsubmit="send(); return false;">
+  <div class="inner">
+    <input id="msg" autocomplete="off" placeholder="Type a message to Cleo…">
+    <button id="sendbtn" type="submit">Send</button>
+  </div>
+</form>
 <script>
 let lastSig = "";
 const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
@@ -724,6 +1137,7 @@ function summaryHtml(turns){
     + cell(' tokens total', tot||null)
     + '</div></div>';
 }
+let pollTimer = null, sending = false;
 async function poll(){
   let dot = document.getElementById('live');
   let nextDelay = 1500;
@@ -741,7 +1155,7 @@ async function poll(){
     const atBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 80;
     const log = document.getElementById('log');
     if (!turns.length && !l){
-      log.innerHTML = '<p class="empty">No conversation yet. Say the wake word to start talking.</p>';
+      log.innerHTML = '<p class="empty">No conversation yet. Say the wake word or type a message below to start.</p>';
       return;
     }
     log.innerHTML = turns.map(t => turnHtml(t.role, t.text, t.ts, t.meta)).join('')
@@ -749,10 +1163,30 @@ async function poll(){
                   + summaryHtml(turns);
     if (atBottom) window.scrollTo(0, document.body.scrollHeight);
   } catch(e){ dot.classList.remove('live'); }
-  finally { setTimeout(poll, nextDelay); }
+  finally { clearTimeout(pollTimer); pollTimer = setTimeout(poll, nextDelay); }
 }
+// Force an immediate re-render without spawning a second poll loop.
+function kick(){ clearTimeout(pollTimer); lastSig = ''; poll(); }
 async function clearChat(){
-  await fetch('/chat/clear', {method:'POST'}); lastSig = ''; poll();
+  await fetch('/chat/clear', {method:'POST'}); kick();
+}
+async function send(){
+  const inp = document.getElementById('msg'), btn = document.getElementById('sendbtn');
+  const text = inp.value.trim();
+  if (!text || sending) return;
+  sending = true; inp.value = ''; inp.disabled = btn.disabled = true; btn.textContent = '…';
+  kick();                                   // show the user bubble the server just logged
+  try {
+    const r = await fetch('/chat/send', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok){ alert(d.error || 'Send failed.'); }
+    else if (d.note){ alert(d.note); }
+  } catch(e){ alert('Send failed: ' + e); }
+  finally {
+    sending = false; inp.disabled = btn.disabled = false; btn.textContent = 'Send';
+    inp.focus(); kick();
+  }
 }
 poll();
 </script>

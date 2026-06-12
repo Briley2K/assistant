@@ -478,6 +478,36 @@ def chat_stream(user_message: str):
     _history.append({"role": "assistant", "content": "".join(parts).strip()})
 
 
+def chat_text_stream(user_message: str):
+    """Tool-aware streaming reply to a TYPED message (from the control panel).
+
+    Like chat_stream, but in native-audio mode it generates on the model that is
+    already loaded for voice (the audio instance) instead of loading a second
+    text-only copy of the model. Shares conversation history with the voice turns
+    so typed and spoken messages keep one context. History updates when consumed."""
+    backend = _resolve_backend()
+
+    _history.append({"role": "user", "content": user_message})
+
+    messages = [{"role": "system", "content": _full_system(native=False)}]
+    messages.extend(_history[-config.CONTEXT_TURNS * 2:])
+
+    parts: list[str] = []
+    if backend == "llamacpp":
+        # Reuse the already-loaded audio model for text when running native, so a
+        # typed message never triggers a second model load.
+        audio = config.STT_MODE == "native"
+        for delta in _run_with_tools(messages, audio=audio):
+            parts.append(delta)
+            yield delta
+    else:
+        text = _tool_loop_nonstream(messages, backend)
+        parts.append(text)
+        yield text
+
+    _history.append({"role": "assistant", "content": "".join(parts).strip()})
+
+
 def reset_history() -> None:
     """Clear conversation history."""
     _history.clear()

@@ -137,3 +137,4 @@ def parse_tool_call(text: str):
 
 # Register the built-in skills on import.
 from modules.skills import builtins as _builtins  # noqa: E402,F401
+from modules.skills import apps as _apps          # noqa: E402,F401

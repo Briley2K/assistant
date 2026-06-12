@@ -33,6 +33,9 @@ def warmup() -> None:
     if config.TTS_ENGINE == "kokoro":
         from modules import kokoro_tts
         kokoro_tts._get()
+    elif config.TTS_ENGINE == "neutts":
+        from modules import neutts_tts
+        neutts_tts.warmup()
     else:
         _get_voice()
 
@@ -42,6 +45,9 @@ def _synth_wav(cleaned: str) -> bytes:
     if config.TTS_ENGINE == "kokoro":
         from modules import kokoro_tts
         return kokoro_tts.synth_wav(cleaned)
+    if config.TTS_ENGINE == "neutts":
+        from modules import neutts_tts
+        return neutts_tts.synth_wav(cleaned)
     piper = _get_voice()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:

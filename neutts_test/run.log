@@ -1,0 +1,25 @@
+=== waiting for install to finish ===
+=== install finished; verifying imports ===
+imports OK
+=== running synth test (downloads models on first run) ===
+W0612 16:33:24.451000 809485 .venv/lib/python3.12/site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+llama_context: n_ctx_seq (2048) < n_ctx_train (32768) -- the full capacity of the model will not be utilized
+/home/briley/assistant/neutts_test/.venv/lib/python3.12/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+/home/briley/assistant/neutts_test/.venv/lib/python3.12/site-packages/perth/perth_net/__init__.py:1: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_filename
+[espeak] using bundled lib: /home/briley/assistant/neutts_test/.venv/lib/python3.12/site-packages/espeakng_loader/libespeak-ng.so
+[1/3] loading NeuTTS Air (downloads backbone GGUF + neucodec on first run)...
+Loading phonemizer...
+Loading backbone from: neuphonic/neutts-air-q4-gguf on cpu ...
+Using seed 3209192852
+Loading codec from: neuphonic/neucodec on cpu ...
+loaded PerthNet (Implicit) at step 250,000
+      loaded in 63.7s
+[2/3] encoding reference voice (dave)...
+[3/3] synthesizing 122 chars...
+
+DONE -> /home/briley/assistant/neutts_test/out.wav
+  audio: 8.2s | synth: 7.2s | realtime factor: 0.88x (faster than realtime)
+RESULT: EXIT_0
+-rw-rw-r-- 1 briley briley 385K Jun 12 16:34 neutts_test/out.wav

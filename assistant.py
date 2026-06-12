@@ -9,6 +9,7 @@ import time
 import atexit
 import random
 import signal
+import threading
 import subprocess
 
 # Add project root to path so 'config' and 'modules' are importable
@@ -17,9 +18,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import config
 from modules.wake_word import listen_for_wake_word
-from modules import audio, stt, llm, tts, status, phrases, wake_word, chatlog, live, gpu, screen, panel
+from modules import (audio, stt, llm, tts, status, phrases, wake_word, chatlog,
+                     live, gpu, screen, panel, textq)
 
 NATIVE_AUDIO = config.STT_MODE == "native"
+
+# Serializes a turn so the typed-message watcher and the voice loop never drive
+# the model / audio device at the same time. The voice loop holds it only while
+# actively handling a turn (not while idle-waiting for the wake word), so typed
+# messages get answered between voice turns.
+_turn_lock = threading.Lock()
+# Set while the assistant is asleep (model unloaded) — typed messages are dropped
+# rather than reloading the model behind the user's back.
+_asleep_flag = threading.Event()
 
 # Wake/sleep commands are matched fuzzily (phrases.matches) so a misheard
 # "cleo" doesn't drop the command. Sleep uses a strict threshold (a false match
@@ -421,6 +432,7 @@ def _stream_metrics(t_start, t_first, t_gen_end, tokens, first_play_ts):
 
 def _go_to_sleep() -> bool:
     print(f"[Sleep] Unloading LLM — say '{config.WAKE_COMMAND}' after the wake word to wake.")
+    _asleep_flag.set()      # typed messages are dropped while the model is unloaded
     status.set_state("speaking")
     chatlog.log("assistant", config.SLEEP_REPLY)
     tts.speak(config.SLEEP_REPLY)
@@ -432,6 +444,7 @@ def _go_to_sleep() -> bool:
 
 def _wake_up() -> bool:
     print("[Sleep] Wake command heard — reloading model...")
+    _asleep_flag.clear()
     llm.warmup()
     if not NATIVE_AUDIO:
         stt._get_model()
@@ -486,26 +499,85 @@ def _start_overlay():
     print("[Overlay] Status orb started (top-right).")
 
 
-def _check_model_file():
-    # The local GGUF is only needed when llama-cpp actually loads it: native
-    # audio always does, and so does the explicit "llamacpp" text backend.
-    # Ollama / remote-API models (e.g. Nemotron) have no local file to check.
-    needs_gguf = NATIVE_AUDIO or config.LLM_BACKEND == "llamacpp"
-    if needs_gguf and not os.path.exists(config.LLM_MODEL_PATH):
-        print(f"ERROR: model not found at:\n  {config.LLM_MODEL_PATH}")
-        print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it,")
-        print("or switch the backend to Ollama / remote API in the control panel.")
-        sys.exit(1)
+def _effective_backend() -> str:
+    """The backend that will actually be used (resolving 'auto' by probing
+    Ollama), so we can validate the right prerequisites before loading anything."""
+    b = config.LLM_BACKEND
+    if b == "auto":
+        return "ollama" if llm._ollama_available() else "llamacpp"
+    return b
 
-    if NATIVE_AUDIO and not os.path.exists(config.LLM_MMPROJ_PATH):
-        print(f"ERROR: audio mmproj not found at:\n  {config.LLM_MMPROJ_PATH}")
-        print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it.")
-        sys.exit(1)
+
+def _config_error(msg: str) -> None:
+    """Report an unrecoverable configuration problem and exit CLEANLY (code 0),
+    so systemd's Restart=on-failure does NOT hammer-restart us in a crash loop.
+    The fix is a settings change (download the model, or pick another backend),
+    not a retry — the control panel surfaces the stopped service."""
+    print(f"\n[Config] {msg}\n", flush=True)
+    sys.exit(0)
+
+
+def _check_model_file():
+    backend = _effective_backend()
+
+    # The local GGUF is loaded only by llama-cpp (native audio always uses it;
+    # the text path uses it when the effective backend is llamacpp). Ollama /
+    # remote-API models have no local file to check.
+    needs_gguf = NATIVE_AUDIO or backend == "llamacpp"
+    if needs_gguf and not os.path.exists(config.LLM_MODEL_PATH):
+        _config_error(
+            f"Model '{config.LLM_MODEL}' has no local file at:\n  {config.LLM_MODEL_PATH}\n"
+            "Open the control panel and either click 'Download model', switch the\n"
+            "backend to Ollama / remote API, or pick a model that's already present.")
+
+    if NATIVE_AUDIO and config.LLM_MMPROJ_PATH and not os.path.exists(config.LLM_MMPROJ_PATH):
+        _config_error(
+            f"Audio projector (mmproj) not found at:\n  {config.LLM_MMPROJ_PATH}\n"
+            "Run 'bash download_models.sh', or switch to a text-only model + Whisper.")
 
     if not os.path.exists(config.PIPER_VOICE):
-        print(f"ERROR: Piper voice not found at:\n  {config.PIPER_VOICE}")
-        print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it.")
-        sys.exit(1)
+        _config_error(
+            f"Piper TTS voice not found at:\n  {config.PIPER_VOICE}\n"
+            "Run 'bash setup.sh' (or 'bash download_models.sh') to download it.")
+
+
+def _handle_text_turn(text: str) -> None:
+    """Answer one typed message from the control panel, reusing the loaded model.
+    The panel already logged the user turn (so it shows instantly even if we're
+    busy); here we just stream the reply — spoken aloud and into the chat view —
+    and log it. Runs under _turn_lock so it never overlaps a voice turn."""
+    print(f"\n[Text] You: {text}", flush=True)
+    status.set_state("thinking")
+    # The panel already logged this user turn (so it shows instantly), so start
+    # the live view WITHOUT the user text — otherwise it renders twice (once from
+    # the chat log, once from live.user) until the turn ends.
+    live.begin("thinking")
+    print("Assistant: ", end="", flush=True)
+    response, metrics = _speak_stream(llm.chat_text_stream(text))
+    if config.CHATLOG_ENABLED and response:
+        chatlog.log("assistant", response, metrics)
+    live.clear()
+    status.set_state("idle")
+
+
+def _text_input_watcher() -> None:
+    """Background thread: drain typed messages from the panel inbox and answer
+    them between voice turns. Messages that arrive while asleep are discarded
+    (the offset still advances) so they don't replay on the next wake."""
+    offset = textq.size()      # ignore anything already queued before we started
+    while True:
+        time.sleep(0.4)
+        try:
+            msgs, offset = textq.drain(offset)
+            if not msgs or _asleep_flag.is_set():
+                continue       # nothing to do, or asleep → drop (offset advanced)
+            for text in msgs:
+                if _asleep_flag.is_set():
+                    break
+                with _turn_lock:
+                    _handle_text_turn(text)
+        except Exception as e:
+            print(f"[Text] watcher error: {e}", flush=True)
 
 
 def main():
@@ -541,52 +613,60 @@ def main():
     signal.signal(signal.SIGTERM, _quit)   # systemd stop — sys.exit runs atexit
 
     _start_overlay()
+
+    # Answer typed messages from the control panel between voice turns.
+    threading.Thread(target=_text_input_watcher, daemon=True,
+                     name="text-input").start()
+
     asleep = False
 
     while True:
-        # 1. Wait for the wake word, then record the first utterance.
+        # 1. Wait for the wake word (idle — no lock held, so typed messages can be
+        # answered now), then take the turn lock for the active part of the turn.
         status.set_state("idle")
         live.clear()
         listen_for_wake_word()
-        status.set_state("listening")
-        live.begin("listening")
-        print("\n[Listening...]" if not asleep else "\n[Asleep — listening for wake command...]",
-              flush=True)
 
-        # The request usually follows the wake word in one breath, so listen with
-        # a short onset window first. If the user said ONLY the wake word, give a
-        # quick spoken ack ("Yes?") and listen again with the full window.
-        wav_bytes = audio.record_until_silence(max_wait_ms=1800)
-        if not audio.last_stats.get("triggered"):
-            ack = random.choice(config.WAKE_ACKS)
-            print(f"Assistant: {ack}", flush=True)
-            status.set_state("speaking")
-            tts.speak(ack)
+        with _turn_lock:
             status.set_state("listening")
             live.begin("listening")
-            wav_bytes = audio.record_until_silence()
+            print("\n[Listening...]" if not asleep else "\n[Asleep — listening for wake command...]",
+                  flush=True)
+
+            # The request usually follows the wake word in one breath, so listen with
+            # a short onset window first. If the user said ONLY the wake word, give a
+            # quick spoken ack ("Yes?") and listen again with the full window.
+            wav_bytes = audio.record_until_silence(max_wait_ms=1800)
             if not audio.last_stats.get("triggered"):
-                print("[No speech detected, going back to idle]")
+                ack = random.choice(config.WAKE_ACKS)
+                print(f"Assistant: {ack}", flush=True)
+                status.set_state("speaking")
+                tts.speak(ack)
+                status.set_state("listening")
+                live.begin("listening")
+                wav_bytes = audio.record_until_silence()
+                if not audio.last_stats.get("triggered"):
+                    print("[No speech detected, going back to idle]")
+                    continue
+            status.set_state("thinking")
+            live.phase("thinking")
+
+            # 2. Asleep: everything heavy is unloaded; a small CPU-only Whisper just
+            # listens for the wake command, leaving the GPU free for other work.
+            if asleep:
+                heard = _spotter_text(wav_bytes)
+                if phrases.matches(heard, config.WAKE_COMMAND, _WAKE_MATCH_THRESHOLD):
+                    asleep = _wake_up()
+                    # Just woke — listen fresh for the actual request (no wake word).
+                    asleep = _run_conversation(None)
+                else:
+                    print(f"[Sleep] Heard {heard!r} — ignoring (say '{config.WAKE_COMMAND}' to wake).")
                 continue
-        status.set_state("thinking")
-        live.phase("thinking")
 
-        # 2. Asleep: everything heavy is unloaded; a small CPU-only Whisper just
-        # listens for the wake command, leaving the GPU free for other work.
-        if asleep:
-            heard = _spotter_text(wav_bytes)
-            if phrases.matches(heard, config.WAKE_COMMAND, _WAKE_MATCH_THRESHOLD):
-                asleep = _wake_up()
-                # Just woke — listen fresh for the actual request (no wake word).
-                asleep = _run_conversation(None)
-            else:
-                print(f"[Sleep] Heard {heard!r} — ignoring (say '{config.WAKE_COMMAND}' to wake).")
-            continue
-
-        # 3. Reply to the first utterance, then stay in a follow-up conversation
-        # until the user is done. _run_conversation handles the chat log, live
-        # view, sleep, and "anything else?" prompting.
-        asleep = _run_conversation(wav_bytes)
+            # 3. Reply to the first utterance, then stay in a follow-up conversation
+            # until the user is done. _run_conversation handles the chat log, live
+            # view, sleep, and "anything else?" prompting.
+            asleep = _run_conversation(wav_bytes)
 
 
 if __name__ == "__main__":

@@ -124,9 +124,9 @@ def _get_llamacpp():
     global _llm
     if _llm is None:
         from llama_cpp import Llama
-        print(f"[LLM] Loading GGUF on {_device_label()}: {config.GEMMA_MODEL_PATH}")
+        print(f"[LLM] Loading GGUF on {_device_label()}: {config.LLM_MODEL_PATH}")
         _llm = Llama(
-            model_path=config.GEMMA_MODEL_PATH,
+            model_path=config.LLM_MODEL_PATH,
             n_gpu_layers=config.LLM_N_GPU_LAYERS,
             n_ctx=config.LLM_N_CTX,
             verbose=False,
@@ -155,9 +155,9 @@ def _get_audio_llm():
         from llama_cpp import Llama
         from modules.gemma_audio import AudioGemma4Handler
         print(f"[LLM] Loading Gemma 4 + audio mmproj (native voice) on {_device_label()}...")
-        handler = AudioGemma4Handler(clip_model_path=config.GEMMA_MMPROJ_PATH, verbose=False)
+        handler = AudioGemma4Handler(clip_model_path=config.LLM_MMPROJ_PATH, verbose=False)
         _audio_llm = Llama(
-            model_path=config.GEMMA_MODEL_PATH,
+            model_path=config.LLM_MODEL_PATH,
             chat_handler=handler,
             n_gpu_layers=config.LLM_N_GPU_LAYERS,
             n_ctx=config.LLM_N_CTX,

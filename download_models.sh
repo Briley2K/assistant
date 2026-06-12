@@ -41,10 +41,12 @@ from huggingface_hub import hf_hub_download
 REPO = "lmstudio-community/gemma-4-12B-it-GGUF"
 DEST = os.path.join(sys.argv[1], "models", "gemma")
 
-for current_path, filename in (
-    (config.GEMMA_MODEL_PATH,  "gemma-4-12B-it-Q4_K_M.gguf"),
-    (config.GEMMA_MMPROJ_PATH, "mmproj-gemma-4-12B-it-BF16.gguf"),
-):
+# Always fetch the Gemma GGUF (the bundled local model) regardless of which
+# model is currently selected. Other models (e.g. Nemotron) run via Ollama and
+# are pulled with `ollama pull`, not downloaded here.
+_gemma = config.LLM_MODELS["gemma4-12b"]
+for filename in (_gemma["gguf"], _gemma["mmproj"]):
+    current_path = os.path.join(DEST, filename)
     if os.path.exists(current_path):
         print(f"already present: {current_path}")
     else:

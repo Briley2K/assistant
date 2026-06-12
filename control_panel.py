@@ -36,6 +36,17 @@ def skill_list():
         return []
 
 
+def llm_models():
+    """(key, label) for every selectable LLM, from the config registry."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        return [(k, v["label"]) for k, v in config.LLM_MODELS.items()]
+    except Exception:
+        return [("gemma4-12b", "Gemma 4 12B")]
+
+
 def kokoro_voice_names():
     import numpy as np
     try:
@@ -94,6 +105,7 @@ def index():
         bundled_wake_words=BUNDLED_WAKE_WORDS,
         whisper_models=WHISPER_MODELS,
         backends=BACKENDS,
+        llm_models=llm_models(),
         llm_devices=LLM_DEVICES,
         stt_modes=STT_MODES,
         tts_engines=TTS_ENGINES,
@@ -120,6 +132,7 @@ def save():
     s["wake_command"]        = f.get("wake_command", "").strip() or "wake up"
     s["sleep_reply"]         = f.get("sleep_reply", "").strip() or "Going to sleep."
     s["wake_reply"]          = f.get("wake_reply", "").strip() or "Awake and ready."
+    s["llm_model"]           = f.get("llm_model", "gemma4-12b")
     s["llm_backend"]         = f.get("llm_backend", "auto")
     s["llm_device"]          = f.get("llm_device", "auto")
 
@@ -400,6 +413,16 @@ PAGE = """<!doctype html>
 
 <div class="card">
   <h2 style="margin-top:0">LLM connection</h2>
+  <label>Model</label>
+  <select name="llm_model">
+    {% for key, label in llm_models %}
+    <option value="{{ key }}" {{ 'selected' if (s.llm_model or 'gemma4-12b')==key else '' }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">Picks which model to run. Text-only models (e.g. Nemotron) automatically use
+     Whisper for speech — native audio needs an audio-capable model like Gemma 4.
+     Nemotron runs via Ollama: <code>ollama pull nemotron-3-nano-30b</code> first, and make sure
+     the tag matches the Ollama field below (blank = the model's default tag).</p>
   <label>Backend</label>
   <select name="llm_backend">
     {% for b in backends %}
@@ -417,7 +440,8 @@ PAGE = """<!doctype html>
      gpu / cpu force one. (Needs a CUDA-enabled llama-cpp build for GPU — see enable_gpu_llm.sh.)</p>
   <div class="row">
     <div><label>Ollama host</label><input name="ollama_host" value="{{ s.ollama_host or '' }}"></div>
-    <div><label>Ollama model</label><input name="ollama_model" value="{{ s.ollama_model or '' }}"></div>
+    <div><label>Ollama model (override — blank = model default)</label>
+         <input name="ollama_model" placeholder="uses selected model's tag" value="{{ s.ollama_model or '' }}"></div>
   </div>
 </div>
 

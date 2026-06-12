@@ -10,9 +10,10 @@
   "wake_command": "cleo wake up",
   "sleep_reply": "Going to sleep.",
   "wake_reply": "Awake and ready.",
+  "llm_model": "gemma4-12b",
   "llm_backend": "auto",
   "ollama_host": "http://localhost:11434",
-  "ollama_model": "gemma4-12b",
+  "ollama_model": "",
   "whisper_model": "small",
   "api": {
     "base_url": "",

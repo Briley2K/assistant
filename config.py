@@ -35,36 +35,77 @@ def _load_settings() -> dict:
 _S = _load_settings()
 
 
-# --- LLM ---
-# Search order: local copy (downloaded by setup.sh), then the LM Studio copy on
-# the Windows drive. If neither exists yet, paths point at the local download
-# target so download_models.sh knows where to put them.
-_GGUF_DIRS = [
-    os.path.join(_BASE, "models", "gemma"),
-    ("/run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/"
-     "lmstudio-community/gemma-4-12B-it-GGUF"),
-]
+# --- LLM models (switchable from the control panel) ---
+# A catalog of selectable models. The panel's "Model" dropdown stores a key in
+# settings.json ("llm_model"); everything below — GGUF paths, the Ollama tag,
+# and whether the model can hear audio natively — derives from the chosen entry.
+# Add a new model by adding an entry here; it then appears in the dropdown.
+#
+#   ollama:  default Ollama tag (the panel's "Ollama model" field overrides it).
+#   gguf:    GGUF filename for the local llama-cpp backend.
+#   mmproj:  audio/vision projector filename, or None for text-only models. Only
+#            a model WITH an mmproj can use native-audio STT; text-only models
+#            fall back to Whisper automatically (see STT_MODE below).
+#   dirs:    directories searched for the GGUF/mmproj, in order. If nothing is
+#            found, paths point at dirs[0] so download_models.sh knows where to
+#            put them.
+LLM_MODELS = {
+    "gemma4-12b": {
+        "label":  "Gemma 4 12B (local · native audio)",
+        "ollama": "gemma4-12b",
+        "gguf":   "gemma-4-12B-it-Q4_K_M.gguf",
+        "mmproj": "mmproj-gemma-4-12B-it-BF16.gguf",   # audio+vision
+        "dirs":   [
+            os.path.join(_BASE, "models", "gemma"),
+            ("/run/media/briley/AE24D19024D15C41/Users/Briley/.lmstudio/models/"
+             "lmstudio-community/gemma-4-12B-it-GGUF"),
+        ],
+    },
+    "nemotron-nano-30b": {
+        "label":  "NVIDIA Nemotron Nano 3 30B (Ollama · text-only)",
+        # NOTE: verify this tag matches what `ollama list` shows. Pull it first:
+        #       ollama pull nemotron-3-nano-30b
+        # Adjust the tag here, or override it in the control panel's Ollama field.
+        "ollama": "nemotron-3-nano-30b",
+        "gguf":   "nemotron-3-nano-30b-Q4_K_M.gguf",
+        "mmproj": None,            # text-only — no native audio, uses Whisper
+        "dirs":   [os.path.join(_BASE, "models", "nemotron")],
+    },
+}
+
+# Selected model (key into LLM_MODELS); falls back to Gemma if unknown.
+LLM_MODEL = _S.get("llm_model", "gemma4-12b")
+if LLM_MODEL not in LLM_MODELS:
+    LLM_MODEL = "gemma4-12b"
+_MODEL = LLM_MODELS[LLM_MODEL]
 
 
-def _find_gguf(filename: str) -> str:
-    for d in _GGUF_DIRS:
+def _find_gguf(filename: str, dirs: list[str]) -> str:
+    for d in dirs:
         path = os.path.join(d, filename)
         if os.path.exists(path):
             return path
-    return os.path.join(_GGUF_DIRS[0], filename)
+    return os.path.join(dirs[0], filename)
 
 
-GEMMA_MODEL_PATH  = _find_gguf("gemma-4-12B-it-Q4_K_M.gguf")
-GEMMA_MMPROJ_PATH = _find_gguf("mmproj-gemma-4-12B-it-BF16.gguf")  # audio+vision
+LLM_MODEL_PATH  = _find_gguf(_MODEL["gguf"], _MODEL["dirs"])
+LLM_MMPROJ_PATH = _find_gguf(_MODEL["mmproj"], _MODEL["dirs"]) if _MODEL["mmproj"] else None
 
-# Speech input: "native" feeds audio straight to Gemma 4 (no Whisper);
-# "whisper" transcribes first, then sends text.
+# True if the selected model can hear audio directly (has an mmproj projector).
+NATIVE_AUDIO_OK = LLM_MMPROJ_PATH is not None
+
+# Speech input: "native" feeds audio straight to the model (no Whisper);
+# "whisper" transcribes first, then sends text. Native needs an audio-capable
+# model — text-only models (e.g. Nemotron) fall back to Whisper automatically.
 STT_MODE = _S.get("stt_mode", "native")
+if STT_MODE == "native" and not NATIVE_AUDIO_OK:
+    STT_MODE = "whisper"
 
 # Backend: "auto" (Ollama→llama-cpp), "ollama", "llamacpp", or "api".
 LLM_BACKEND  = _S.get("llm_backend", "auto")
 OLLAMA_HOST  = _S.get("ollama_host", "http://localhost:11434")
-OLLAMA_MODEL = _S.get("ollama_model", "gemma4-12b")
+# Blank "ollama_model" → use the selected model's default tag from LLM_MODELS.
+OLLAMA_MODEL = (_S.get("ollama_model") or "").strip() or _MODEL["ollama"]
 
 # Remote OpenAI-compatible API (used when LLM_BACKEND == "api").
 _API         = _S.get("api", {})
@@ -105,9 +146,9 @@ def _gpu_free_mb() -> int | None:
 def _llm_vram_need_mb() -> int:
     """Estimated VRAM to fit the LLM fully on the GPU: model file(s) + overhead."""
     need = _VRAM_OVERHEAD_MB
-    paths = [GEMMA_MODEL_PATH]
-    if STT_MODE == "native":
-        paths.append(GEMMA_MMPROJ_PATH)   # mmproj is co-loaded for native audio
+    paths = [LLM_MODEL_PATH]
+    if STT_MODE == "native" and LLM_MMPROJ_PATH:
+        paths.append(LLM_MMPROJ_PATH)     # mmproj is co-loaded for native audio
     for p in paths:
         if os.path.exists(p):
             need += os.path.getsize(p) // (1024 * 1024)

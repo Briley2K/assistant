@@ -134,13 +134,18 @@ def _start_overlay():
 
 
 def _check_model_file():
-    if not os.path.exists(config.GEMMA_MODEL_PATH):
-        print(f"ERROR: Gemma model not found at:\n  {config.GEMMA_MODEL_PATH}")
-        print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it.")
+    # The local GGUF is only needed when llama-cpp actually loads it: native
+    # audio always does, and so does the explicit "llamacpp" text backend.
+    # Ollama / remote-API models (e.g. Nemotron) have no local file to check.
+    needs_gguf = NATIVE_AUDIO or config.LLM_BACKEND == "llamacpp"
+    if needs_gguf and not os.path.exists(config.LLM_MODEL_PATH):
+        print(f"ERROR: model not found at:\n  {config.LLM_MODEL_PATH}")
+        print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it,")
+        print("or switch the backend to Ollama / remote API in the control panel.")
         sys.exit(1)
 
-    if NATIVE_AUDIO and not os.path.exists(config.GEMMA_MMPROJ_PATH):
-        print(f"ERROR: audio mmproj not found at:\n  {config.GEMMA_MMPROJ_PATH}")
+    if NATIVE_AUDIO and not os.path.exists(config.LLM_MMPROJ_PATH):
+        print(f"ERROR: audio mmproj not found at:\n  {config.LLM_MMPROJ_PATH}")
         print("Run 'bash setup.sh' (or 'bash download_models.sh') to download it.")
         sys.exit(1)
 

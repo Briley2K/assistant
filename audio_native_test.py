@@ -74,7 +74,7 @@ def main():
     print("[2] Loading Gemma 4 12B + audio mmproj on GPU...")
     handler = AudioGemma4Handler(clip_model_path=MMPROJ, verbose=False)
     llm = Llama(
-        model_path=config.GEMMA_MODEL_PATH,
+        model_path=config.LLM_MODEL_PATH,
         chat_handler=handler,
         n_gpu_layers=-1,
         n_ctx=4096,

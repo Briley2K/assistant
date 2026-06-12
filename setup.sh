@@ -21,8 +21,11 @@ command -v pw-record >/dev/null || APT_PKGS+=("pipewire-bin")     # mic capture
 command -v aplay     >/dev/null || APT_PKGS+=("alsa-utils")       # playback
 command -v cc        >/dev/null || APT_PKGS+=("build-essential")  # llama-cpp build
 command -v cmake     >/dev/null || APT_PKGS+=("cmake")
-# GTK bindings for the status orb overlay (overlay.py, runs on system python)
-/usr/bin/python3 -c "import gi, cairo" 2>/dev/null || \
+# GTK bindings for the status orb overlay (overlay.py, runs on system python).
+# Must check the cairo *foreign-struct bridge* (python3-gi-cairo), not just
+# "import gi, cairo" — those pass with python3-gi + python3-cairo alone, yet the
+# orb's draw handler still can't receive a cairo.Context, so it paints nothing.
+/usr/bin/python3 -c "import gi; gi.require_version('Gtk','3.0'); gi.require_foreign('cairo')" 2>/dev/null || \
     APT_PKGS+=("python3-gi" "python3-gi-cairo" "gir1.2-gtk-3.0")
 
 if [ ${#APT_PKGS[@]} -gt 0 ]; then
@@ -38,8 +41,14 @@ fi
 # ---------------------------------------------------------------
 echo ""
 echo "=== [2/5] Python virtual environment ==="
-python3 -m venv "$SCRIPT_DIR/.venv"
+# --clear rebuilds from scratch: a venv created before python3-venv was present
+# comes out empty (no pip), and a plain `venv` over it won't repair it.
+if [ -d "$SCRIPT_DIR/.venv" ] && ! "$SCRIPT_DIR/.venv/bin/python3" -m pip --version >/dev/null 2>&1; then
+    echo "Existing .venv is incomplete (no pip) — rebuilding it."
+fi
+python3 -m venv --clear "$SCRIPT_DIR/.venv"
 source "$SCRIPT_DIR/.venv/bin/activate"
+python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
 pip install --quiet --upgrade pip
 
 # ---------------------------------------------------------------

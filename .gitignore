@@ -18,6 +18,10 @@ models/
 settings.local.json
 .env
 
+# Runtime logs (per-machine, not source)
+logs/
+*.jsonl
+
 # OS / editor
 .DS_Store
 *.swp

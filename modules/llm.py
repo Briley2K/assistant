@@ -25,6 +25,43 @@ _audio_llm = None                 # lazy llama_cpp.Llama instance (native audio 
 SLEEP_TOKEN = "[SLEEP]"
 
 
+def is_sleep(reply: str) -> bool:
+    """True if a model reply is the sleep signal — tolerant of the case and
+    punctuation the audio model sometimes adds (e.g. '[sleep]', 'Sleep.'), but
+    not a normal sentence that merely mentions sleeping."""
+    r = (reply or "").strip()
+    if SLEEP_TOKEN in r.upper():
+        return True
+    return re.sub(r"[^a-z]", "", r.lower()) == "sleep"   # bare token, nothing else
+
+
+# Like the sleep token, the model flags "look at my screen" requests with a
+# token (native mode has no transcript to match), which assistant.py turns into
+# a screenshot fed back to the model.
+VIEW_SCREEN_TOKEN = "[VIEWSCREEN]"
+
+
+def is_view_screen(reply: str) -> bool:
+    """True if the model is asking to look at the user's screen."""
+    return VIEW_SCREEN_TOKEN in (reply or "").upper()
+
+
+# Side-panel visibility — "show the panel" / "hide the panel" — same token
+# pattern; assistant.py forwards the command to the overlay.
+SHOW_PANEL_TOKEN = "[SHOWPANEL]"
+HIDE_PANEL_TOKEN = "[HIDEPANEL]"
+
+
+def panel_command(reply: str):
+    """'show' / 'hide' if the reply is a side-panel command, else None."""
+    r = (reply or "").upper()
+    if SHOW_PANEL_TOKEN in r:
+        return "show"
+    if HIDE_PANEL_TOKEN in r:
+        return "hide"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Backend resolution
 # --------------------------------------------------------------------------
@@ -205,6 +242,28 @@ def _full_system(native: bool) -> str:
             f'If the user says "{config.SLEEP_COMMAND}" or otherwise clearly tells you '
             f"to go to sleep, reply with exactly {SLEEP_TOKEN} and nothing else."
         )
+    if native and config.SCREEN_VIEW_ENABLED:
+        parts.append(
+            "If the user asks you to look at, check out, or see their screen, reply "
+            f"with exactly {VIEW_SCREEN_TOKEN} and nothing else — a screenshot will "
+            "then be given to you to look at."
+        )
+    if config.SIDE_PANEL_ENABLED:
+        parts.append(
+            "When you produce something the user would want to read or copy rather "
+            "than just hear — source code, a story, a poem, an essay, a long list, "
+            "or structured data — put that content inside a triple-backtick fenced "
+            "block (``` with a language tag for code, or ```text for prose). It is "
+            "shown on a side panel with a Copy button, not read aloud, so keep what "
+            "you say out loud to a short spoken introduction of one sentence."
+        )
+        if native:
+            parts.append(
+                "If the user asks you to show, open, or bring up the side panel, "
+                f"reply with exactly {SHOW_PANEL_TOKEN} and nothing else. If they ask "
+                "you to hide, close, or dismiss the side panel, reply with exactly "
+                f"{HIDE_PANEL_TOKEN} and nothing else."
+            )
     if config.SKILLS_ENABLED:
         from modules import skills
         tp = skills.tools_prompt()
@@ -316,6 +375,34 @@ def chat_audio_stream(wav_bytes: bytes):
     _history.append({"role": "assistant", "content": reply})
     if SLEEP_TOKEN in reply:
         del _history[-2:]
+
+
+def chat_image_stream(image_bytes: bytes, instruction: str = ""):
+    """Tool-aware streaming reply about a screenshot: feeds the image plus an
+    instruction (and the prior conversation as context), yielding final-answer
+    text deltas. The raw image is dropped from history afterward so later turns
+    don't re-encode it — a short text trace is kept in its place."""
+    from modules.gemma_audio import image_part
+    _get_audio_llm()
+
+    content = [image_part(image_bytes)]
+    if instruction:
+        content.append({"type": "text", "text": instruction})
+    user_idx = len(_history)
+    _history.append({"role": "user", "content": content})
+
+    messages = [{"role": "system", "content": _full_system(native=True)}]
+    messages.extend(_history[-config.CONTEXT_TURNS * 2:])
+
+    parts: list[str] = []
+    for delta in _run_with_tools(messages, audio=True):
+        parts.append(delta)
+        yield delta
+
+    reply = "".join(parts).strip()
+    _history.append({"role": "assistant", "content": reply})
+    _history[user_idx] = {"role": "user",
+                          "content": (f"[Looked at the user's screen] {instruction}".strip())}
 
 
 # --------------------------------------------------------------------------

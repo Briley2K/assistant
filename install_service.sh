@@ -6,6 +6,14 @@ BASE="$(cd "$(dirname "$0")" && pwd)"
 UNIT_DIR="$HOME/.config/systemd/user"
 APP_DIR="$HOME/.local/share/applications"
 
+# Both services run "$BASE/.venv/bin/python3 ...", so the environment must exist
+# first — otherwise the units install but silently fail to start.
+if ! "$BASE/.venv/bin/python3" -m pip --version >/dev/null 2>&1; then
+    echo "ERROR: Python environment not ready at $BASE/.venv"
+    echo "Run the installer first:   bash setup.sh"
+    exit 1
+fi
+
 mkdir -p "$UNIT_DIR" "$APP_DIR"
 
 echo "=== Installing systemd user units ==="

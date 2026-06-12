@@ -1,14 +1,14 @@
 {
-  "system_prompt": "You are a helpful, concise voice assistant named \"Cleo\". Keep responses short and natural-sounding — you are speaking, not writing. Avoid bullet points, markdown, or long lists unless specifically asked. When the user explicitly asks you to be thorough, detailed, or long-winded, do so.",
+  "system_prompt": "You are a helpful, concise voice assistant named \"Cleo\". Keep responses short and natural-sounding \u2014 you are speaking, not writing. Avoid bullet points, markdown, or long lists unless specifically asked. When the user explicitly asks you to be thorough, detailed, or long-winded, do so.\r\nWhen speaking about dates use the worded version of years and other related numbers.",
   "stt_mode": "native",
   "tts_engine": "kokoro",
   "kokoro_voice": "af_heart",
   "kokoro_speed": 1.0,
   "wake_word": "hey cleo",
-  "wake_word_threshold": 0.5,
-  "sleep_command": "cleo sleep",
-  "wake_command": "cleo wake up",
-  "sleep_reply": "Going to sleep.",
+  "wake_word_threshold": 0.3,
+  "sleep_command": "go to sleep",
+  "wake_command": "wake up",
+  "sleep_reply": "Freeing up system resources.",
   "wake_reply": "Awake and ready.",
   "llm_backend": "auto",
   "ollama_host": "http://localhost:11434",
@@ -22,6 +22,9 @@
   "llm_device": "auto",
   "skills": true,
   "skills_disabled": [],
-  "weather_place": "Dallas, Texas",
-  "weather_units": "fahrenheit"
+  "weather_place": "San Angelo, Texas",
+  "weather_units": "fahrenheit",
+  "overlay": true,
+  "gpu_compute_percent": 50,
+  "tts_volume": 1.0
 }

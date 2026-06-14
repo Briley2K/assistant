@@ -19,6 +19,28 @@ _backend: str | None = None      # resolved backend: "ollama" | "llamacpp"
 _llm = None                       # lazy llama_cpp.Llama instance (text)
 _audio_llm = None                 # lazy llama_cpp.Llama instance (native audio + mmproj)
 
+# Wake-time load overrides (set by assistant._adapt_to_gpu before warmup) so a
+# reload can pick a quant / offload that fits the VRAM free right now. None = use
+# the configured defaults. Only consulted while the model is unloaded.
+_gguf_override: str | None = None
+_gpu_layers_override: int | None = None
+
+
+def set_load_override(gguf_path: str | None, gpu_layers: int | None) -> None:
+    """Override the GGUF file and GPU-layer count used by the NEXT model load.
+    Takes effect only while the model is unloaded — call before warmup()."""
+    global _gguf_override, _gpu_layers_override
+    _gguf_override = gguf_path
+    _gpu_layers_override = gpu_layers
+
+
+def _active_model_path() -> str:
+    return _gguf_override or config.LLM_MODEL_PATH
+
+
+def _active_gpu_layers() -> int:
+    return _gpu_layers_override if _gpu_layers_override is not None else config.LLM_N_GPU_LAYERS
+
 # In native-audio mode there is no transcript to string-match against, so the
 # model itself flags the sleep command by replying with this token (see
 # chat_audio). assistant.py checks for it and unloads the model.
@@ -129,6 +151,7 @@ def _call_api(messages: list[dict]) -> str:
         "model": config.API_MODEL,
         "messages": messages,
         "temperature": config.LLM_TEMPERATURE,
+        "max_tokens": config.LLM_MAX_TOKENS,
     }
     data = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
@@ -161,11 +184,13 @@ def _get_llamacpp():
     global _llm
     if _llm is None:
         from llama_cpp import Llama
-        print(f"[LLM] Loading GGUF on {_device_label()}: {config.LLM_MODEL_PATH}")
+        print(f"[LLM] Loading GGUF on {_device_label()}: {_active_model_path()}")
         _llm = Llama(
-            model_path=config.LLM_MODEL_PATH,
-            n_gpu_layers=config.LLM_N_GPU_LAYERS,
+            model_path=_active_model_path(),
+            n_gpu_layers=_active_gpu_layers(),
             n_ctx=config.LLM_N_CTX,
+            n_threads=config.LLM_N_THREADS,
+            n_threads_batch=config.LLM_N_THREADS,
             verbose=False,
         )
         print("[LLM] GGUF loaded.")
@@ -177,7 +202,7 @@ def _call_llamacpp(messages: list[dict]) -> str:
     response = llm.create_chat_completion(
         messages=messages,
         temperature=config.LLM_TEMPERATURE,
-        max_tokens=512,
+        max_tokens=config.LLM_MAX_TOKENS,
         stop=["<end_of_turn>"],
     )
     return response["choices"][0]["message"]["content"].strip()
@@ -194,10 +219,12 @@ def _get_audio_llm():
         print(f"[LLM] Loading Gemma 4 + audio mmproj (native voice) on {_device_label()}...")
         handler = AudioGemma4Handler(clip_model_path=config.LLM_MMPROJ_PATH, verbose=False)
         _audio_llm = Llama(
-            model_path=config.LLM_MODEL_PATH,
+            model_path=_active_model_path(),
             chat_handler=handler,
-            n_gpu_layers=config.LLM_N_GPU_LAYERS,
+            n_gpu_layers=_active_gpu_layers(),
             n_ctx=config.LLM_N_CTX,
+            n_threads=config.LLM_N_THREADS,
+            n_threads_batch=config.LLM_N_THREADS,
             verbose=False,
         )
         print("[LLM] Native-audio model loaded.")
@@ -222,7 +249,7 @@ def chat_audio(wav_bytes: bytes) -> str:
     messages.extend(_history[-config.CONTEXT_TURNS * 2:])
 
     out = llm.create_chat_completion(
-        messages=messages, temperature=config.LLM_TEMPERATURE, max_tokens=512,
+        messages=messages, temperature=config.LLM_TEMPERATURE, max_tokens=config.LLM_MAX_TOKENS,
     )
     reply = out["choices"][0]["message"]["content"].strip()
     _history.append({"role": "assistant", "content": reply})
@@ -269,6 +296,11 @@ def _full_system(native: bool) -> str:
         tp = skills.tools_prompt()
         if tp:
             parts.append(tp)
+        if config.FILE_ACCESS_ENABLED:
+            from modules.skills import files
+            hint = files.locations_hint()
+            if hint:
+                parts.append(hint)
     return "\n".join(parts)
 
 
@@ -276,7 +308,7 @@ def _stream_completion(messages: list[dict], audio: bool):
     """Yield content deltas for one generation pass over `messages`."""
     m = _get_audio_llm() if audio else _get_llamacpp()
     kw = dict(messages=messages, temperature=config.LLM_TEMPERATURE,
-              max_tokens=512, stream=True)
+              max_tokens=config.LLM_MAX_TOKENS, stream=True)
     if not audio:
         kw["stop"] = ["<end_of_turn>"]
     for ch in m.create_chat_completion(**kw):
@@ -285,35 +317,123 @@ def _stream_completion(messages: list[dict], audio: bool):
             yield delta
 
 
-# Gemma 4 leaks control tokens into the *streamed* output (the non-streaming
-# parser would strip them): an often-empty thinking block, channel markers, and
-# turn delimiters. We filter them on the fly so nothing is spoken or parsed wrong.
+# The local Gemma 4 build wraps its reasoning in a channel block:
+#   <|channel>thought\n<channel|> ...reasoning/answer... <turn|>
+# The angle-bracket markers are *special tokens*, which llama-cpp strips from the
+# streamed text — so the literal "<|channel>" never reaches us and the regexes
+# below only ever fire for a backend that surfaces the brackets (e.g. a remote
+# API). What DOES leak is the channel *name* between them: an ordinary "thought"
+# text token on its own line. Normally the chat handler swallows it, but when the
+# model gets stuck looping the header it emits "thought\n" over and over with no
+# real answer — that wall of "thought" is what the TTS was reading aloud.
 _THOUGHT_RE = re.compile(r"<\|channel>thought.*?<channel\|>", re.S)
 _MARK_RE = re.compile(r"<\|[^>]*>|<[^>]*\|>|<(?:end_of_turn|start_of_turn|eos|bos)>")
 
+# Bare reasoning-channel labels that leak as a word alone on a line once the
+# surrounding special tokens are stripped. Kept tight to what this model emits so
+# real prose ("I gave it some thought.", "Think it over") is never touched — only
+# a line that is *exactly* one of these is dropped.
+_CHANNEL_LABELS = frozenset({"thought", "thoughts", "think", "thinking"})
+# A healthy reply leaks zero such lines; this many means the model is looping on
+# the thinking header, so we cut the generation off instead of spinning to
+# max_tokens (and never speak the repeats).
+_MAX_CHANNEL_LINES = 3
+
+
+def _is_channel_label(line: str) -> bool:
+    return line.strip().lower() in _CHANNEL_LABELS
+
+
+def _label_prefix(s: str) -> bool:
+    """True if `s` (a partial, still-growing line) could become a bare channel
+    label — so we hold it back until a space or newline reveals which it is."""
+    t = s.strip().lower()
+    return bool(t) and not any(c.isspace() for c in t) \
+        and any(lbl.startswith(t) for lbl in _CHANNEL_LABELS)
+
 
 def _strip_stream(raw):
-    """Yield cleaned text from a raw delta stream: removes Gemma thinking blocks
-    and control tokens, holding back only a possible partial token at the tail."""
+    """Yield speakable text from a raw delta stream. Strips any literal control
+    markers and the leaked reasoning-channel header (a bare "thought" line), and
+    cuts the stream off if the model is stuck looping that header so the wall of
+    "thought" never reaches the speaker. Holds back only a possible partial
+    marker or label forming at the tail."""
     buf = ""
+    channel_lines = 0
+    line_dirty = False          # already emitted text on the current (unfinished) line?
     for delta in raw:
         buf += delta
-        buf = _THOUGHT_RE.sub("", buf)            # drop complete thinking blocks
-        # A channel marker is open but not yet closed — could be a thinking
-        # block forming, so hold everything until the close arrives.
+        buf = _MARK_RE.sub("", _THOUGHT_RE.sub("", buf))
+        # A literal channel marker is open but not yet closed (only happens on a
+        # bracket-surfacing backend) — hold until the close arrives.
         if "<|channel>" in buf and "<channel|>" not in buf:
             continue
-        buf = _MARK_RE.sub("", buf)
-        lt = buf.rfind("<")                       # possible partial marker at the end
+        # Emit completed lines; drop a line that is *only* a leaked channel label
+        # (but never one we've already started speaking — that's real prose).
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if not line_dirty and _is_channel_label(line):
+                channel_lines += 1
+                if channel_lines >= _MAX_CHANNEL_LINES:
+                    return                       # degenerate reasoning loop — stop
+                line_dirty = False
+                continue
+            yield line + "\n"
+            line_dirty = False
+        # buf is now a partial line. Hold it if it might still grow into a bare
+        # label; otherwise emit, keeping back a possible partial marker at the end.
+        if not line_dirty and _label_prefix(buf):
+            continue
+        lt = buf.rfind("<")
         if lt != -1 and ">" not in buf[lt:]:
             emit, buf = buf[:lt], buf[lt:]
         else:
             emit, buf = buf, ""
         if emit:
             yield emit
+            line_dirty = True
     buf = _MARK_RE.sub("", _THOUGHT_RE.sub("", buf))
-    if buf:
+    if buf:                     # trailing text with no closing newline is real prose
         yield buf
+
+
+# --------------------------------------------------------------------------
+# Reasoning models (Nemotron): the chat template opens the assistant turn inside
+# a <think> block, so generation begins with chain-of-thought and the real answer
+# only starts after the closing </think>. None of the reasoning may be spoken.
+# --------------------------------------------------------------------------
+_THINK_CLOSE = "</think>"
+
+
+def _strip_reasoning(raw):
+    """Gate a raw delta stream for a reasoning model: swallow everything up to and
+    including </think>, then stream the answer that follows. If the tag never
+    arrives (the model reasoned past the token budget without answering), speak
+    nothing rather than reading the chain-of-thought aloud."""
+    buf, thinking = "", True
+    for delta in raw:
+        if not thinking:
+            yield delta
+            continue
+        buf += delta
+        idx = buf.find(_THINK_CLOSE)
+        if idx != -1:
+            print(f"[LLM] (thought {len(buf[:idx].strip())} chars, not spoken)", flush=True)
+            thinking = False
+            rest = buf[idx + len(_THINK_CLOSE):]
+            buf = ""
+            if rest:
+                yield rest
+    if thinking:
+        print("[LLM] reasoning didn't finish within the token budget — no answer "
+              "to speak. Raise the model's max_tokens if this recurs.", flush=True)
+
+
+def _strip_reasoning_text(text: str) -> str:
+    """Drop a leading <think>…</think> block from a complete reply (the
+    non-streaming Ollama/API path). No closing tag → leave the text untouched."""
+    i = text.find(_THINK_CLOSE)
+    return text[i + len(_THINK_CLOSE):].lstrip() if i != -1 else text
 
 
 def _run_with_tools(messages: list[dict], audio: bool):
@@ -322,7 +442,10 @@ def _run_with_tools(messages: list[dict], audio: bool):
     token it's executed and fed back; otherwise it's streamed out to be spoken."""
     from modules import skills
     for _step in range(skills.MAX_TOOL_STEPS + 1):
-        clean = _strip_stream(_stream_completion(messages, audio=audio))
+        raw = _stream_completion(messages, audio=audio)
+        if config.LLM_REASONING:
+            raw = _strip_reasoning(raw)   # drop <think>…</think> before anything else
+        clean = _strip_stream(raw)
         head, is_tool = "", None
         for chunk in clean:
             head += chunk
@@ -433,6 +556,8 @@ def chat(user_message: str) -> str:
     else:
         reply = _call_llamacpp(messages)
 
+    if config.LLM_REASONING:
+        reply = _strip_reasoning_text(reply)
     _history.append({"role": "assistant", "content": reply})
     return reply
 
@@ -442,6 +567,8 @@ def _tool_loop_nonstream(messages: list[dict], backend: str) -> str:
     from modules import skills
     for _step in range(skills.MAX_TOOL_STEPS + 1):
         reply = _call_ollama(messages) if backend == "ollama" else _call_api(messages)
+        if config.LLM_REASONING:
+            reply = _strip_reasoning_text(reply)
         call = skills.parse_tool_call(reply)
         if not call:
             return reply

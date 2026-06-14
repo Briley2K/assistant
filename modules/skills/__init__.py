@@ -75,7 +75,13 @@ def tools_prompt() -> str:
         '  [[TOOL]] {"name": "<tool>", "args": {<arguments>}}',
         "Do not describe the call or add other text. After the tool result comes",
         "back, answer the user naturally and briefly. If no tool is needed, just",
-        "answer normally. Available tools:",
+        "answer normally.",
+        "You MUST also call the relevant tool to UNDO or REVERSE a previous action",
+        "(e.g. turning the volume back up, unmuting, restoring). Raising and lowering",
+        "are equally actions that require the tool. NEVER claim you have changed,",
+        "restored, or undone something a tool controls unless you actually emitted",
+        "the tool call this turn — saying it without calling the tool does nothing.",
+        "Available tools:",
     ]
     for s in skills:
         if s.parameters:
@@ -138,3 +144,7 @@ def parse_tool_call(text: str):
 # Register the built-in skills on import.
 from modules.skills import builtins as _builtins  # noqa: E402,F401
 from modules.skills import apps as _apps          # noqa: E402,F401
+from modules.skills import volume as _volume      # noqa: E402,F401
+from modules.skills import files as _files        # noqa: E402,F401
+from modules.skills import imagegen as _imagegen  # noqa: E402,F401
+from modules.skills import video as _video         # noqa: E402,F401

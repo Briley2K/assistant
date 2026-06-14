@@ -27,7 +27,7 @@ WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 BACKENDS = ["auto", "ollama", "llamacpp", "api"]
 LLM_DEVICES = ["auto", "gpu", "cpu"]
 STT_MODES = ["native", "whisper"]
-TTS_ENGINES = ["kokoro", "piper", "neutts"]
+TTS_ENGINES = ["kokoro", "piper", "neutts", "chatterbox"]
 NEUTTS_BACKBONES = ["neuphonic/neutts-air-q4-gguf", "neuphonic/neutts-air-q8-gguf"]
 
 
@@ -53,31 +53,322 @@ def skill_list():
         return []
 
 
+def _custom_files(dir_path: str, exts: tuple) -> list:
+    """Sorted filenames in a custom-model dir matching the given extensions."""
+    try:
+        return sorted(f for f in os.listdir(dir_path)
+                      if f.lower().endswith(exts) and os.path.isfile(os.path.join(dir_path, f)))
+    except OSError:
+        return []
+
+
 def llm_models():
-    """(key, label) for every selectable LLM, from the config registry."""
+    """(key, label) for every selectable LLM: registry models, any uploaded custom
+    GGUFs (key 'custom:<file>'), plus a 'None' option (image-only mode)."""
     try:
         import sys
         sys.path.insert(0, BASE)
         import config
-        return [(k, v["label"]) for k, v in config.LLM_MODELS.items()]
+        items = [(k, v["label"]) for k, v in config.LLM_MODELS.items()]
+        items += [("custom:" + f, "Custom: " + f)
+                  for f in _custom_files(config.CUSTOM_GGUF_DIR, (".gguf",))]
     except Exception:
-        return [("gemma4-12b", "Gemma 4 12B")]
+        items = [("gemma4-12b", "Gemma 4 12B")]
+    return [("none", "None — no language model (image-only)")] + items
+
+
+def image_models():
+    """(key, label) for image models: catalog, any uploaded custom checkpoints
+    (key 'custom:<file>'), plus a 'None' option."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        items = [(k, v["label"]) for k, v in config.IMAGEGEN_MODELS.items()]
+        items += [("custom:" + f, "Custom: " + f)
+                  for f in _custom_files(config.CUSTOM_IMAGE_DIR, (".safetensors", ".ckpt"))]
+    except Exception:
+        items = []
+    return [("none", "None — image generation off")] + items
+
+
+def image_meta() -> dict:
+    """{key: {vram, size}} for the image models, for the panel's VRAM hint JS."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        return {k: {"vram": v.get("vram_gb"), "size": v.get("size")}
+                for k, v in config.IMAGEGEN_MODELS.items()}
+    except Exception:
+        return {}
+
+
+def video_models():
+    """(key, label) for video models: catalog, uploaded custom checkpoints
+    (key 'custom:<file>'), plus a 'None' option."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        items = [(k, v["label"]) for k, v in config.VIDEOGEN_MODELS.items()]
+        items += [("custom:" + f, "Custom: " + f)
+                  for f in _custom_files(config.CUSTOM_VIDEO_DIR, (".safetensors", ".ckpt"))]
+    except Exception:
+        items = []
+    return [("none", "None — video generation off")] + items
+
+
+def video_meta() -> dict:
+    """{key: {vram, size}} for video models, for the panel's VRAM hint JS."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        return {k: {"vram": v.get("vram_gb"), "size": v.get("size")}
+                for k, v in config.VIDEOGEN_MODELS.items()}
+    except Exception:
+        return {}
+
+
+_IMAGE_DL_MARKER = os.path.join(BASE, "logs", ".image_downloading")
+
+
+def _hf_repo_dir(repo: str) -> str:
+    """The HuggingFace hub cache folder for a repo (shared by the main env and the
+    image helper venv)."""
+    base = (os.environ.get("HUGGINGFACE_HUB_CACHE")
+            or os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"))
+    return os.path.join(base, "models--" + repo.replace("/", "--"))
+
+
+def _image_downloaded(repo: str) -> bool:
+    """True if the model's weights are cached: a completed diffusers snapshot
+    (model_index.json present) with no in-flight .incomplete blobs."""
+    if not repo:
+        return False
+    d = _hf_repo_dir(repo)
+    blobs, snaps = os.path.join(d, "blobs"), os.path.join(d, "snapshots")
+    if not os.path.isdir(snaps):
+        return False
+    try:
+        if os.path.isdir(blobs) and any(f.endswith(".incomplete") for f in os.listdir(blobs)):
+            return False
+        for rev in os.listdir(snaps):
+            if os.path.exists(os.path.join(snaps, rev, "model_index.json")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _image_downloaded_bytes(repo: str) -> int:
+    """Bytes present in the repo's blob cache (counts .incomplete partials)."""
+    blobs = os.path.join(_hf_repo_dir(repo), "blobs")
+    total = 0
+    try:
+        for fn in os.listdir(blobs):
+            try:
+                total += os.path.getsize(os.path.join(blobs, fn))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def image_status(s: dict) -> dict:
+    """Status of the image-gen backend for the panel: selected model, whether its
+    weights are downloaded / downloading, and whether the helper venv is installed
+    and the model is loaded / loading / errored."""
+    info = {"model": s.get("image_model", "none"), "enabled": False,
+            "installed": False, "ready": False, "loading": False,
+            "device": s.get("image_device", "cuda"), "error": None, "repo": None,
+            "downloaded": False, "downloading": False, "custom": False,
+            "dl_gb": None, "downloaded_gb": None, "pct": None}
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        model = info["model"]
+        info["installed"] = (os.path.exists(config.IMAGEGEN_PYTHON)
+                             and os.path.exists(config.IMAGEGEN_SERVER))
+
+        # Uploaded custom checkpoint: local file, already "downloaded" if present.
+        if model.startswith("custom:"):
+            fn = model.split(":", 1)[1]
+            path = os.path.join(config.CUSTOM_IMAGE_DIR, fn)
+            info["custom"] = True
+            info["enabled"] = True
+            info["repo"] = path
+            info["downloaded"] = os.path.exists(path)
+            if info["downloaded"] and info["installed"]:
+                from modules import imagegen
+                h = imagegen._health()
+                if h is not None and h.get("model") == path:
+                    info["ready"] = bool(h.get("ready"))
+                    info["loading"] = not h.get("ready") and not h.get("error")
+                    info["error"] = h.get("error")
+            return info
+
+        entry = config.IMAGEGEN_MODELS.get(model) if model != "none" else None
+        info["enabled"] = entry is not None
+        info["repo"] = entry["repo"] if entry else None
+        repo = info["repo"]
+        if not info["enabled"] or not repo:
+            return info
+        info["dl_gb"] = entry.get("dl_gb")
+
+        # An in-flight download is marked by logs/.image_downloading (its repo id).
+        marker_repo = None
+        try:
+            with open(_IMAGE_DL_MARKER) as f:
+                marker_repo = f.read().strip()
+        except OSError:
+            pass
+        if marker_repo == repo:
+            info["downloading"] = True
+            got = _image_downloaded_bytes(repo)
+            info["downloaded_gb"] = round(got / 1e9, 2)
+            if info["dl_gb"]:
+                info["pct"] = max(0, min(99, round(got / (info["dl_gb"] * 1e9) * 100)))
+            return info
+
+        info["downloaded"] = _image_downloaded(repo)
+        if info["downloaded"] and info["installed"]:
+            from modules import imagegen
+            h = imagegen._health()           # None if not running yet
+            if h is not None and h.get("model") == repo:   # ignore a helper on a different model
+                info["ready"] = bool(h.get("ready"))
+                info["loading"] = not h.get("ready") and not h.get("error")
+                info["error"] = h.get("error")
+    except Exception:
+        pass
+    return info
+
+
+_VIDEO_DL_MARKER = os.path.join(BASE, "logs", ".video_downloading")
+
+
+def video_status(s: dict) -> dict:
+    """Status of the video-gen backend (mirrors image_status): selected model,
+    weights downloaded / downloading, helper installed / loaded / loading / error."""
+    info = {"model": s.get("video_model", "none"), "enabled": False,
+            "installed": False, "ready": False, "loading": False,
+            "device": s.get("video_device", "cuda"), "error": None, "repo": None,
+            "downloaded": False, "downloading": False, "custom": False,
+            "dl_gb": None, "downloaded_gb": None, "pct": None}
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        model = info["model"]
+        info["installed"] = (os.path.exists(config.VIDEOGEN_PYTHON)
+                             and os.path.exists(config.VIDEOGEN_SERVER))
+        if model == "none":
+            return info
+
+        if model.startswith("custom:"):
+            fn = model.split(":", 1)[1]
+            path = os.path.join(config.CUSTOM_VIDEO_DIR, fn)
+            info.update(custom=True, enabled=True, repo=path,
+                        downloaded=os.path.exists(path))
+            if info["downloaded"] and info["installed"]:
+                from modules import videogen
+                h = videogen._health()
+                if h is not None and h.get("model") == path:
+                    info["ready"] = bool(h.get("ready"))
+                    info["loading"] = not h.get("ready") and not h.get("error")
+                    info["error"] = h.get("error")
+            return info
+
+        entry = config.VIDEOGEN_MODELS.get(model)
+        info["enabled"] = entry is not None
+        if not entry:
+            return info
+        repo = entry["repo"]
+        info["repo"] = repo
+        info["dl_gb"] = entry.get("dl_gb")
+
+        marker_repo = None
+        try:
+            with open(_VIDEO_DL_MARKER) as f:
+                marker_repo = f.read().strip()
+        except OSError:
+            pass
+        if marker_repo == repo:
+            info["downloading"] = True
+            got = _image_downloaded_bytes(repo)        # same HF-cache blob scan
+            info["downloaded_gb"] = round(got / 1e9, 2)
+            if info["dl_gb"]:
+                info["pct"] = max(0, min(99, round(got / (info["dl_gb"] * 1e9) * 100)))
+            return info
+
+        info["downloaded"] = _image_downloaded(repo)   # same diffusers-snapshot check
+        if info["downloaded"] and info["installed"]:
+            from modules import videogen
+            h = videogen._health()
+            if h is not None and h.get("model") == repo:
+                info["ready"] = bool(h.get("ready"))
+                info["loading"] = not h.get("ready") and not h.get("error")
+                info["error"] = h.get("error")
+    except Exception:
+        pass
+    return info
+
+
+def _selected_quant_name(s: dict, key: str):
+    """The quant chosen for `key` in live settings, else its default, else None.
+    Resolved from the passed-in settings (not config._S, which is import-time)."""
+    import config
+    quants = config.model_quants(key)
+    if not quants:
+        return None
+    want = (s.get("model_quants") or {}).get(key)
+    match = next((q for q in quants if q["name"] == want), None)
+    if not match:
+        match = next((q for q in quants if q.get("default")), quants[0])
+    return match["name"]
 
 
 def model_status(s: dict) -> dict:
     """Whether the selected model's local GGUF is present / downloading, read
-    from live settings + the static registry (not cached config state)."""
+    from live settings + the static registry (not cached config state). The GGUF
+    is resolved for the selected quant when the model has variants."""
     info = {"key": s.get("llm_model", "gemma4-12b"), "present": False,
-            "size_gb": None, "downloading": False, "downloadable": False, "label": ""}
+            "size_gb": None, "downloading": False, "downloadable": False,
+            "label": "", "has_quants": False, "quant": None, "none": False, "custom": False}
+    if info["key"] == "none":
+        info["none"] = True
+        info["label"] = "No language model"
+        return info
     try:
         import sys
         sys.path.insert(0, BASE)
         import config
-        m = config.LLM_MODELS.get(info["key"]) or config.LLM_MODELS["gemma4-12b"]
-        info["label"] = m.get("label", info["key"])
+        key = info["key"]
+        if key.startswith("custom:"):
+            fn = key.split(":", 1)[1]
+            p = os.path.join(config.CUSTOM_GGUF_DIR, fn)
+            info["label"] = "Custom: " + fn
+            info["present"] = os.path.exists(p)
+            info["custom"] = True
+            if info["present"]:
+                info["size_gb"] = round(os.path.getsize(p) / 1e9, 1)
+            return info
+        m = config.LLM_MODELS.get(key) or config.LLM_MODELS["gemma4-12b"]
+        info["label"] = m.get("label", key)
         info["downloadable"] = bool(m.get("hf_repo"))
-        found = next((os.path.join(d, m["gguf"]) for d in m["dirs"]
-                      if os.path.exists(os.path.join(d, m["gguf"]))), None)
+        quants = config.model_quants(key)
+        info["has_quants"] = bool(quants)
+        if quants:
+            qname = _selected_quant_name(s, key)
+            info["quant"] = qname
+            gguf = next((q["gguf"] for q in quants if q["name"] == qname), m["gguf"])
+        else:
+            gguf = m["gguf"]
+        found = next((os.path.join(d, gguf) for d in m["dirs"]
+                      if os.path.exists(os.path.join(d, gguf))), None)
         info["present"] = found is not None
         if found:
             info["size_gb"] = round(os.path.getsize(found) / 1e9, 1)
@@ -85,6 +376,76 @@ def model_status(s: dict) -> dict:
     except Exception:
         pass
     return info
+
+
+def gpu_total_gb():
+    """Total VRAM (GB) of the largest CUDA device, or None if no usable GPU."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        mb = config.gpu_total_mb()
+        return round(mb / 1024, 1) if mb else None
+    except Exception:
+        return None
+
+
+def quant_data() -> dict:
+    """Per-model data the VRAM-fit bar needs in JS: each model's quant sizes
+    (and whether each is already downloaded), the co-loaded mmproj size for
+    native-audio models, the fixed VRAM overhead, and — for single-file models —
+    the on-disk size if present. Keyed by model key."""
+    out = {}
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        for key, m in config.LLM_MODELS.items():
+            native = bool(m.get("mmproj"))
+            mmproj_gb = 0.0
+            if native:
+                for d in m["dirs"]:
+                    p = os.path.join(d, m["mmproj"])
+                    if os.path.exists(p):
+                        mmproj_gb = round(os.path.getsize(p) / 1e9, 2)
+                        break
+            quants = []
+            for q in config.model_quants(key):
+                present = any(os.path.exists(os.path.join(d, q["gguf"])) for d in m["dirs"])
+                quants.append({"name": q["name"], "gb": q.get("size_gb"),
+                               "present": present, "def": bool(q.get("default"))})
+            file_gb = None
+            if not quants:
+                for d in m["dirs"]:
+                    p = os.path.join(d, m["gguf"])
+                    if os.path.exists(p):
+                        file_gb = round(os.path.getsize(p) / 1e9, 2)
+                        break
+            out[key] = {"native": native, "mmproj_gb": mmproj_gb,
+                        "overhead_gb": round(config.VRAM_OVERHEAD_GB, 2),
+                        "quants": quants, "file_gb": file_gb}
+        # Uploaded custom GGUFs: single-file, text-only; size from the file.
+        for f in _custom_files(config.CUSTOM_GGUF_DIR, (".gguf",)):
+            p = os.path.join(config.CUSTOM_GGUF_DIR, f)
+            out["custom:" + f] = {
+                "native": False, "mmproj_gb": 0.0,
+                "overhead_gb": round(config.VRAM_OVERHEAD_GB, 2),
+                "quants": [], "file_gb": round(os.path.getsize(p) / 1e9, 2)}
+    except Exception:
+        pass
+    return out
+
+
+def file_blacklist_default() -> list:
+    """The default read-access blacklist from config, shown pre-filled in the
+    panel so the user keeps the secret-shielding patterns unless they edit them."""
+    try:
+        import sys
+        sys.path.insert(0, BASE)
+        import config
+        return config.DEFAULT_FILE_BLACKLIST
+    except Exception:
+        return []
 
 
 def kokoro_voice_names():
@@ -95,6 +456,9 @@ def kokoro_voice_names():
         return ["af_heart"]
 
 app = Flask(__name__)
+# Custom model uploads are multi-GB (GGUFs / SD checkpoints) — lift the request
+# size cap. Werkzeug spools the upload to a temp file on disk, so memory is fine.
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024 * 1024   # 64 GB
 
 
 # --------------------------------------------------------------------------
@@ -138,6 +502,7 @@ def service_state() -> dict:
 # --------------------------------------------------------------------------
 @app.route("/")
 def index():
+    import config
     return render_template_string(
         PAGE,
         s=load_settings(),
@@ -146,7 +511,16 @@ def index():
         whisper_models=WHISPER_MODELS,
         backends=BACKENDS,
         llm_models=llm_models(),
+        image_models=image_models(),
+        image_status=image_status(load_settings()),
+        image_meta=image_meta(),
+        video_models=video_models(),
+        video_status=video_status(load_settings()),
+        video_meta=video_meta(),
         model_status=model_status(load_settings()),
+        gpu_total_gb=gpu_total_gb(),
+        quant_data=quant_data(),
+        chatterbox_vram_gb=config.CHATTERBOX_VRAM_GB,
         llm_devices=LLM_DEVICES,
         stt_modes=STT_MODES,
         tts_engines=TTS_ENGINES,
@@ -155,6 +529,7 @@ def index():
         neutts_backbones=NEUTTS_BACKBONES,
         skills=skill_list(),
         disabled=set(load_settings().get("skills_disabled", [])),
+        file_blacklist_default=file_blacklist_default(),
         msg=request.args.get("msg", ""),
     )
 
@@ -170,6 +545,12 @@ def save():
     s["neutts_voice"]        = f.get("neutts_voice", "jo")
     s["neutts_backbone"]     = f.get("neutts_backbone", "neuphonic/neutts-air-q4-gguf")
     s["kokoro_speed"]        = float(f.get("kokoro_speed", 1.0))
+    for _k, _d in (("chatterbox_exaggeration", 0.5), ("chatterbox_cfg", 0.5),
+                   ("chatterbox_temperature", 0.8)):
+        try:
+            s[_k] = float(f.get(_k, _d))
+        except (TypeError, ValueError):
+            s[_k] = _d
     try:
         s["tts_volume"]      = max(0.0, min(1.0, int(f.get("tts_volume", 100)) / 100.0))
     except (TypeError, ValueError):
@@ -182,6 +563,17 @@ def save():
     s["sleep_reply"]         = f.get("sleep_reply", "").strip() or "Going to sleep."
     s["wake_reply"]          = f.get("wake_reply", "").strip() or "Awake and ready."
     s["llm_model"]           = f.get("llm_model", "gemma4-12b")
+    s["image_model"]         = f.get("image_model", "none")
+    s["image_device"]        = f.get("image_device", "cuda")
+    s["video_model"]         = f.get("video_model", "none")
+    s["video_device"]        = f.get("video_device", "cuda")
+    # Per-model quant choice (only for models that ship variants). Keep prior
+    # choices for other models; only update the one currently selected.
+    _quant = f.get("llm_quant", "").strip()
+    if _quant:
+        _mq = dict(s.get("model_quants") or {})
+        _mq[s["llm_model"]] = _quant
+        s["model_quants"] = _mq
     s["followup_mode"]       = bool(f.get("followup_mode"))
     s["followup_prompt"]     = f.get("followup_prompt", "").strip() or "Is there anything else I can help with?"
     s["followup_signoff"]    = f.get("followup_signoff", "").strip() or "Okay, I'll be here if you need me."
@@ -194,6 +586,10 @@ def save():
         s["gpu_compute_percent"] = max(10, min(100, int(f.get("gpu_compute_percent", 100))))
     except (TypeError, ValueError):
         s["gpu_compute_percent"] = 100
+    try:
+        s["cpu_compute_percent"] = max(10, min(100, int(f.get("cpu_compute_percent", 100))))
+    except (TypeError, ValueError):
+        s["cpu_compute_percent"] = 100
 
     s["skills"]        = bool(f.get("skills"))
     enabled_skills     = set(f.getlist("skill_on"))
@@ -201,6 +597,18 @@ def save():
     s["skills_disabled"] = [n for n in all_skill_names if n not in enabled_skills]
     s["weather_place"] = f.get("weather_place", "").strip()
     s["weather_units"] = f.get("weather_units", "fahrenheit")
+
+    # File access (read-only): master switch + allowed roots / blacklist, one
+    # path-or-glob per line in each textarea.
+    def _lines(name):
+        return [ln.strip() for ln in f.get(name, "").splitlines() if ln.strip()]
+    s["file_access"]           = bool(f.get("file_access"))
+    s["file_access_roots"]     = _lines("file_access_roots")
+    s["file_access_blacklist"] = _lines("file_access_blacklist")
+    try:
+        s["file_access_max_kb"] = max(1, min(4096, int(f.get("file_access_max_kb", 256))))
+    except (TypeError, ValueError):
+        s["file_access_max_kb"] = 256
     s["ollama_host"]         = f.get("ollama_host", "").strip()
     s["ollama_model"]        = f.get("ollama_model", "").strip()
     s["whisper_model"]       = f.get("whisper_model", "small")
@@ -243,6 +651,11 @@ def test_voice():
             voice = f.get("neutts_voice", "jo")
             wav = neutts_tts.synth_wav(sample, voice=voice)   # first call may load the model (~15-30s)
             label = f"neutts: {voice}"
+        elif engine == "chatterbox":
+            from modules import chatterbox_tts
+            voice = f.get("neutts_voice", "sophon_2")         # shares the cloned-voice clips
+            wav = chatterbox_tts.synth_wav(sample, voice=voice)   # first call loads the GPU model
+            label = f"chatterbox: {voice}"
         else:
             import io, wave
             from modules import tts
@@ -259,9 +672,10 @@ def test_voice():
 
 @app.route("/neutts_upload", methods=["POST"])
 def neutts_upload():
-    """Add a custom NeuTTS reference voice: save the uploaded WAV under
-    neutts_test/samples/<name>.wav and auto-transcribe it (Whisper) to the
-    matching .txt, so it appears in the NeuTTS voice dropdown."""
+    """Add a custom NeuTTS reference voice. The uploaded clip is downmixed to
+    mono and trimmed to NeuTTS' usable length (a too-long reference overflows the
+    model and fails), then transcribed (Whisper) to a MATCHING .txt, and both are
+    saved under neutts_test/samples/<name>.{wav,txt} so the voice just works."""
     from flask import jsonify
     import sys
     sys.path.insert(0, BASE)
@@ -276,17 +690,16 @@ def neutts_upload():
     samples = os.path.join(BASE, "neutts_test", "samples")
     os.makedirs(samples, exist_ok=True)
     try:
-        from modules import stt
-        stt._wav_bytes_to_float32(data)          # validates it's a decodable WAV
-        transcript = stt.transcribe(data).strip()
+        from modules import voice_prep
+        wav_out, transcript, info = voice_prep.prepare_reference(data)
     except Exception as e:
-        return jsonify({"error": f"Couldn't read/transcribe — use a clean mono WAV. ({e})"}), 400
+        return jsonify({"error": f"Couldn't read/transcribe — use a clean audio file. ({e})"}), 400
 
     with open(os.path.join(samples, f"{name}.wav"), "wb") as out:
-        out.write(data)
+        out.write(wav_out)
     with open(os.path.join(samples, f"{name}.txt"), "w") as out:
-        out.write(transcript or "This is a reference voice sample.")
-    return jsonify({"ok": True, "name": name, "transcript": transcript})
+        out.write(transcript)
+    return jsonify({"ok": True, "name": name, "transcript": transcript, **info})
 
 
 @app.route("/control", methods=["POST"])
@@ -306,29 +719,147 @@ def control():
     return redirect(url_for("index", msg=msg))
 
 
+def _download_progress(dest_dir: str, gguf: str, total_gb) -> tuple:
+    """(downloading, downloaded_bytes, total_bytes) for an in-flight download.
+    Progress is read from the partial .incomplete file huggingface_hub writes
+    under the dest's cache; total is the registry's expected size."""
+    downloading = os.path.exists(os.path.join(dest_dir, ".downloading"))
+    downloaded = 0
+    cache = os.path.join(dest_dir, ".cache", "huggingface", "download")
+    try:
+        incs = [os.path.join(cache, f) for f in os.listdir(cache) if f.endswith(".incomplete")]
+        if incs:
+            downloaded = max(os.path.getsize(p) for p in incs)
+    except OSError:
+        pass
+    final = os.path.join(dest_dir, gguf)
+    if os.path.exists(final):
+        downloaded = os.path.getsize(final)
+    total = int(total_gb * 1e9) if total_gb else None
+    return downloading, downloaded, total
+
+
+@app.route("/model_status.json")
+def model_status_json():
+    """Live status for a model+quant (present / downloading / progress), so the
+    panel can update the Model card without a page reload or a Save."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    key = request.args.get("key") or load_settings().get("llm_model", "gemma4-12b")
+    quant = request.args.get("quant", "").strip()
+    if key == "none":
+        return jsonify({"key": "none", "none": True, "present": False,
+                        "downloadable": False, "downloading": False,
+                        "has_quants": False, "quant": None})
+    if key.startswith("custom:"):
+        fn = key.split(":", 1)[1]
+        p = os.path.join(config.CUSTOM_GGUF_DIR, fn)
+        present = os.path.exists(p)
+        return jsonify({"key": key, "custom": True, "present": present,
+                        "downloadable": False, "downloading": False,
+                        "has_quants": False, "quant": None,
+                        "size_gb": round(os.path.getsize(p) / 1e9, 1) if present else None})
+    m = config.LLM_MODELS.get(key)
+    if not m:
+        return jsonify({"error": "unknown model"}), 404
+    quants = config.model_quants(key)
+    size_gb, gguf = None, m["gguf"]
+    if quants:
+        q = next((x for x in quants if x["name"] == quant), None) \
+            or next((x for x in quants if x.get("default")), quants[0])
+        gguf, size_gb, quant = q["gguf"], q.get("size_gb"), q["name"]
+    dest = m["dirs"][0]
+    found = next((os.path.join(d, gguf) for d in m["dirs"]
+                  if os.path.exists(os.path.join(d, gguf))), None)
+    downloading, dl_bytes, total_bytes = _download_progress(dest, gguf, size_gb)
+    present = found is not None and not downloading
+    pct = (max(0, min(100, round(dl_bytes / total_bytes * 100)))
+           if downloading and total_bytes else None)
+    return jsonify({
+        "key": key, "quant": quant or None, "gguf": gguf,
+        "present": present,
+        "size_gb": round(os.path.getsize(found) / 1e9, 1) if found else size_gb,
+        "downloadable": bool(m.get("hf_repo")),
+        "has_quants": bool(quants),
+        "downloading": downloading,
+        "downloaded_gb": round(dl_bytes / 1e9, 2) if downloading else None,
+        "total_gb": size_gb,
+        "pct": pct,
+    })
+
+
 @app.route("/download_model", methods=["POST"])
 def download_model():
     """Start downloading the selected model's GGUF in the background (detached),
-    streaming progress to logs/model_download.log. The page shows a 'downloading'
-    status (driven by the .downloading sentinel) until it finishes."""
+    streaming progress to logs/model_download.log. Returns JSON for an AJAX call
+    (json=1) so the panel can show a live progress bar; otherwise redirects."""
     import sys
+    from flask import jsonify
     # Use the model currently chosen in the dropdown (the form submits with this
     # button), so Download works even before the selection has been saved.
     key = request.form.get("llm_model") or load_settings().get("llm_model", "gemma4-12b")
+    quant = request.form.get("llm_quant", "").strip()
+    want_json = request.form.get("json") == "1"
     script = os.path.join(BASE, "download_model.py")
     log = os.path.join(BASE, "logs", "model_download.log")
+    argv = [sys.executable, script, key] + ([quant] if quant else [])
     try:
         os.makedirs(os.path.dirname(log), exist_ok=True)
         lf = open(log, "w")
         subprocess.Popen(
-            [sys.executable, script, key],
+            argv,
             stdout=lf, stderr=lf, start_new_session=True,
         )
     except OSError as e:
+        if want_json:
+            return jsonify({"error": str(e)}), 500
         return redirect(url_for("index", msg=f"Couldn't start download: {e}"))
+    if want_json:
+        return jsonify({"started": True, "key": key, "quant": quant or None})
     return redirect(url_for("index", msg=(
-        f"Downloading '{key}' in the background — this can take a while (several GB). "
+        f"Downloading '{key}'{(' · ' + quant) if quant else ''} in the background — "
+        "this can take a while (several GB). "
         "Watch logs/model_download.log; the Model section shows when it's ready.")))
+
+
+@app.route("/delete_model", methods=["POST"])
+def delete_model():
+    """Delete a model's local GGUF to free disk space. For a quant model it
+    removes only the named quant's file; the registry entry (and re-download)
+    stays. Only ever removes a known GGUF filename inside the model's own dirs."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    data = request.get_json(silent=True) or request.form
+    key = data.get("key", "")
+    quant = (data.get("quant") or "").strip()
+    m = config.LLM_MODELS.get(key)
+    if not m:
+        return jsonify({"error": "unknown model"}), 404
+    quants = config.model_quants(key)
+    if quants:
+        q = next((x for x in quants if x["name"] == quant), None)
+        if not q:
+            return jsonify({"error": f"unknown quant '{quant}'"}), 400
+        gguf = q["gguf"]
+    else:
+        gguf = m["gguf"]
+    removed, freed = [], 0
+    for d in m["dirs"]:
+        p = os.path.join(d, gguf)
+        if os.path.exists(p):
+            try:
+                freed += os.path.getsize(p)
+                os.remove(p)
+                removed.append(p)
+            except OSError as e:
+                return jsonify({"error": str(e)}), 500
+    if not removed:
+        return jsonify({"ok": True, "removed": [], "note": "nothing to delete"})
+    return jsonify({"ok": True, "removed": removed, "freed_gb": round(freed / 1e9, 1)})
 
 
 @app.route("/restart_panel", methods=["POST"])
@@ -376,15 +907,17 @@ def screen_grant():
 
 
 RESTART_PANEL_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Restarting…</title>
+<html lang="en"><head><meta charset="utf-8"><title>Restarting…</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 6rem auto;
-         padding: 0 1rem; background:#15171c; color:#e6e6e6; text-align:center; }
-  .spin { width:2rem; height:2rem; margin:1.5rem auto; border:3px solid #2c313c;
-          border-top-color:#2d6cdf; border-radius:50%; animation:spin 1s linear infinite; }
+  body { font-family: system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; max-width: 480px; margin: 6rem auto;
+         padding: 0 1rem; background:#0f1117; color:#e8eaf0; text-align:center; }
+  body::before { content:""; position:fixed; inset:0; z-index:-1;
+    background:radial-gradient(900px 500px at 50% -180px, rgba(77,124,255,.16), transparent 70%); }
+  .spin { width:2.2rem; height:2.2rem; margin:1.5rem auto; border:3px solid #262c3a;
+          border-top-color:#4d7cff; border-radius:50%; animation:spin 1s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
-  a { color:#9ecbff; }
+  a { color:#6b9bff; }
 </style>
 <script>
   // The panel is bouncing; poll until it answers, then go home.
@@ -440,6 +973,245 @@ def read_live():
 def chat_json():
     from flask import jsonify
     return jsonify({"turns": read_chat(), "live": read_live()})
+
+
+@app.route("/chat/image/<path:name>")
+def chat_image(name):
+    """Serve a generated image (written by modules/imagegen.py into logs/images).
+    The chat view references these via [[IMAGE:name]] markers in assistant turns."""
+    from flask import send_from_directory, abort
+    safe = os.path.basename(name)               # no path traversal
+    img_dir = os.path.join(BASE, "logs", "images")
+    if not safe or not os.path.exists(os.path.join(img_dir, safe)):
+        abort(404)
+    return send_from_directory(img_dir, safe)
+
+
+@app.route("/chat/video/<path:name>")
+def chat_video(name):
+    """Serve a generated video (written by modules/videogen.py into logs/videos).
+    The chat view references these via [[VIDEO:name]] markers in assistant turns."""
+    from flask import send_from_directory, abort
+    safe = os.path.basename(name)
+    vid_dir = os.path.join(BASE, "logs", "videos")
+    if not safe or not os.path.exists(os.path.join(vid_dir, safe)):
+        abort(404)
+    return send_from_directory(vid_dir, safe)
+
+
+@app.route("/image")
+def image_page():
+    return render_template_string(IMAGE_PAGE)
+
+
+@app.route("/image/status.json")
+def image_status_json():
+    from flask import jsonify
+    s = load_settings()
+    model = request.args.get("model")        # live dropdown value, before Save
+    if model is not None:
+        s = dict(s); s["image_model"] = model
+    return jsonify(image_status(s))
+
+
+@app.route("/image/download", methods=["POST"])
+def image_download():
+    """Pre-download the selected image model's weights into the HF cache in the
+    background (detached), streaming progress to logs/image_download.log. Uses the
+    model from the dropdown so it works before the selection is saved."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    key = request.form.get("image_model") or load_settings().get("image_model", "none")
+    if key not in config.IMAGEGEN_MODELS:
+        return jsonify({"error": "Select an image model first."}), 400
+    script = os.path.join(BASE, "download_image_model.py")
+    log = os.path.join(BASE, "logs", "image_download.log")
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        lf = open(log, "w")
+        subprocess.Popen([sys.executable, script, key],
+                         stdout=lf, stderr=lf, start_new_session=True)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"started": True, "key": key})
+
+
+def _save_upload(field: str, dest_dir: str, exts: tuple):
+    """Stream an uploaded model file into dest_dir. Returns (filename, error)."""
+    from werkzeug.utils import secure_filename
+    f = request.files.get(field)
+    if f is None or not f.filename:
+        return None, "No file provided."
+    name = secure_filename(f.filename)
+    if not name.lower().endswith(exts):
+        return None, f"File must be one of: {', '.join(exts)}"
+    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        f.save(os.path.join(dest_dir, name))        # streams to disk
+    except OSError as e:
+        return None, str(e)
+    return name, None
+
+
+@app.route("/llm/upload", methods=["POST"])
+def llm_upload():
+    """Upload a custom .gguf into models/custom-gguf; it then appears in the LLM
+    dropdown as 'Custom: <file>' (key 'custom:<file>')."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    name, err = _save_upload("file", config.CUSTOM_GGUF_DIR, (".gguf",))
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "name": name, "key": "custom:" + name})
+
+
+@app.route("/image/upload", methods=["POST"])
+def image_upload():
+    """Upload a custom Stable Diffusion checkpoint (.safetensors/.ckpt) into
+    models/custom-image; it appears in the image dropdown as 'Custom: <file>'."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    name, err = _save_upload("file", config.CUSTOM_IMAGE_DIR, (".safetensors", ".ckpt"))
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "name": name, "key": "custom:" + name})
+
+
+@app.route("/image/generate", methods=["POST"])
+def image_generate():
+    """Generate one image from a prompt and return its URL. Used by the standalone
+    /image page; works without the assistant or any LLM running."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Enter a prompt."}), 400
+    try:
+        import config
+        if not config.IMAGEGEN_ENABLED:
+            return jsonify({"error": "No image model selected — pick one in the panel."}), 400
+        from modules import imagegen
+        if not (os.path.exists(config.IMAGEGEN_PYTHON) and os.path.exists(config.IMAGEGEN_SERVER)):
+            return jsonify({"error": "Image venv not installed — run imagegen/setup_imagegen.sh."}), 400
+        kw = {}
+        try:
+            if int(data.get("steps", 0)) > 0:
+                kw["steps"] = int(data["steps"])
+        except (TypeError, ValueError):
+            pass
+        try:
+            if data.get("cfg") not in (None, "", 0, "0"):
+                kw["guidance"] = float(data["cfg"])
+        except (TypeError, ValueError):
+            pass
+        sampler = (data.get("sampler") or "").strip()
+        if sampler and sampler != "default":
+            kw["sampler"] = sampler
+        for dim in ("width", "height"):
+            try:
+                v = int(data.get(dim, 0))
+                if v > 0:
+                    kw[dim] = v
+            except (TypeError, ValueError):
+                pass
+        name = imagegen.save_image(prompt, **kw)
+    except Exception as e:
+        return jsonify({"error": f"Generation failed: {e}"}), 500
+    return jsonify({"ok": True, "url": "/chat/image/" + name, "name": name, "prompt": prompt})
+
+
+# --------------------------------------------------------------------------
+# Video generation (mirrors the image routes)
+# --------------------------------------------------------------------------
+@app.route("/video")
+def video_page():
+    return render_template_string(VIDEO_PAGE)
+
+
+@app.route("/video/status.json")
+def video_status_json():
+    from flask import jsonify
+    s = load_settings()
+    model = request.args.get("model")        # live dropdown value, before Save
+    if model is not None:
+        s = dict(s); s["video_model"] = model
+    return jsonify(video_status(s))
+
+
+@app.route("/video/download", methods=["POST"])
+def video_download():
+    """Pre-download the selected video model's weights into the HF cache in the
+    background (detached), streaming progress to logs/video_download.log."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    key = request.form.get("video_model") or load_settings().get("video_model", "none")
+    if key not in config.VIDEOGEN_MODELS:
+        return jsonify({"error": "Select a video model first."}), 400
+    script = os.path.join(BASE, "download_video_model.py")
+    log = os.path.join(BASE, "logs", "video_download.log")
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        lf = open(log, "w")
+        subprocess.Popen([sys.executable, script, key],
+                         stdout=lf, stderr=lf, start_new_session=True)
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"started": True, "key": key})
+
+
+@app.route("/video/upload", methods=["POST"])
+def video_upload():
+    """Upload a custom video checkpoint (.safetensors/.ckpt) into models/custom-video."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    import config
+    name, err = _save_upload("file", config.CUSTOM_VIDEO_DIR, (".safetensors", ".ckpt"))
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, "name": name, "key": "custom:" + name})
+
+
+@app.route("/video/generate", methods=["POST"])
+def video_generate():
+    """Generate one video from a prompt and return its URL. Used by the /video page;
+    works without the assistant or any LLM running."""
+    from flask import jsonify
+    import sys
+    sys.path.insert(0, BASE)
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Enter a prompt."}), 400
+    try:
+        import config
+        if not config.VIDEOGEN_ENABLED:
+            return jsonify({"error": "No video model selected — pick one in the panel."}), 400
+        from modules import videogen
+        if not (os.path.exists(config.VIDEOGEN_PYTHON) and os.path.exists(config.VIDEOGEN_SERVER)):
+            return jsonify({"error": "Video venv not installed — run video/setup_video.sh."}), 400
+        kw = {}
+        try:
+            if int(data.get("frames", 0)) > 0:
+                kw["frames"] = int(data["frames"])
+            if int(data.get("steps", 0)) > 0:
+                kw["steps"] = int(data["steps"])
+        except (TypeError, ValueError):
+            pass
+        name = videogen.save_video(prompt, **kw)
+    except Exception as e:
+        return jsonify({"error": f"Generation failed: {e}"}), 500
+    return jsonify({"ok": True, "url": "/chat/video/" + name, "name": name, "prompt": prompt})
 
 
 @app.route("/chat/clear", methods=["POST"])
@@ -604,32 +1376,145 @@ def wake_enroll_status():
 
 
 PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Voice Assistant</title>
+<html lang="en" data-theme="midnight"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Assistant</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cleo_theme')||'midnight'}catch(e){}</script>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto;
-         padding: 0 1rem; background:#15171c; color:#e6e6e6; }
-  h1 { font-size: 1.5rem; } h2 { font-size: 1.05rem; margin-top: 1.8rem; color:#9ecbff; }
-  .card { background:#1d2027; border:1px solid #2c313c; border-radius:10px; padding:1rem 1.2rem; margin:1rem 0; }
-  label { display:block; margin:.7rem 0 .2rem; font-size:.85rem; color:#aab; }
-  input, select, textarea { width:100%; box-sizing:border-box; background:#11131a; color:#e6e6e6;
-         border:1px solid #333a47; border-radius:6px; padding:.5rem; font-size:.9rem; }
-  textarea { min-height:90px; resize:vertical; }
-  .row { display:flex; gap:1rem; } .row>div { flex:1; }
-  button { background:#2d6cdf; color:#fff; border:0; border-radius:6px; padding:.55rem 1rem;
-           font-size:.9rem; cursor:pointer; } button:hover { background:#3b7cf0; }
-  button.secondary { background:#333a47; } button.danger { background:#b3402f; }
-  .pill { display:inline-block; padding:.15rem .6rem; border-radius:999px; font-size:.78rem; }
-  .on { background:#1f5135; color:#7ee2a8; } .off { background:#4a2020; color:#f0a3a3; }
-  .msg { background:#23314a; border:1px solid #345; padding:.6rem .9rem; border-radius:8px; }
-  .btns { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.6rem; }
-  .hint { font-size:.78rem; color:#778; margin-top:.3rem; }
+  *{ box-sizing:border-box; }
+  :root{ color-scheme:dark; --radius:14px;
+    --bg:#0f1117; --card:#1a1e27; --card-border:#262c3a; --card-hover:#39435c;
+    --input-bg:#11141c; --input-border:#2e3545; --text:#e8eaf0; --dim:#9aa3b5; --faint:#6b7385;
+    --accent:#4d7cff; --accent2:#6b5cff; --accent-text:#fff;
+    --ok-bg:#14361f; --ok-text:#5fdd8f; --bad-bg:#3a1a1a; --bad-text:#f08a8a;
+    --warn-bg:#3a3320; --warn-text:#e3c878; --msg-bg:#1b2740; --msg-border:#2f4063; --shadow:rgba(0,0,0,.35); }
+  [data-theme="nord"]{ color-scheme:dark; --bg:#262b35; --card:#3b4252; --card-border:#434c5e; --card-hover:#4c566a;
+    --input-bg:#2e3440; --input-border:#434c5e; --text:#eceff4; --dim:#d8dee9; --faint:#8b95a7;
+    --accent:#88c0d0; --accent2:#81a1c1; --accent-text:#2e3440;
+    --ok-bg:#3b4a3f; --ok-text:#a3be8c; --bad-bg:#4a3a3d; --bad-text:#bf616a;
+    --warn-bg:#4a4334; --warn-text:#ebcb8b; --msg-bg:#3b4252; --msg-border:#4c566a; --shadow:rgba(0,0,0,.3); }
+  [data-theme="dracula"]{ color-scheme:dark; --bg:#1b1c25; --card:#282a36; --card-border:#383a4a; --card-hover:#6272a4;
+    --input-bg:#1e1f29; --input-border:#44475a; --text:#f8f8f2; --dim:#bcc0d6; --faint:#6272a4;
+    --accent:#bd93f9; --accent2:#ff79c6; --accent-text:#21222c;
+    --ok-bg:#2d4a37; --ok-text:#50fa7b; --bad-bg:#4a2d33; --bad-text:#ff5555;
+    --warn-bg:#4a4530; --warn-text:#f1fa8c; --msg-bg:#343746; --msg-border:#44475a; --shadow:rgba(0,0,0,.4); }
+  [data-theme="emerald"]{ color-scheme:dark; --bg:#0c1310; --card:#14211b; --card-border:#21342a; --card-hover:#2f5742;
+    --input-bg:#0e1713; --input-border:#243a2e; --text:#e6f0ea; --dim:#9bb3a6; --faint:#6a8579;
+    --accent:#2dd4a7; --accent2:#14b8a6; --accent-text:#04241c;
+    --ok-bg:#14361f; --ok-text:#5fdd8f; --bad-bg:#3a1a1a; --bad-text:#f08a8a;
+    --warn-bg:#3a3320; --warn-text:#e3c878; --msg-bg:#14271f; --msg-border:#25402f; --shadow:rgba(0,0,0,.35); }
+  [data-theme="synthwave"]{ color-scheme:dark; --bg:#181029; --card:#241a3a; --card-border:#3d2c5e; --card-hover:#6d4bb0;
+    --input-bg:#1c1230; --input-border:#3d2c5e; --text:#f5e6ff; --dim:#c4a8e0; --faint:#8a72b0;
+    --accent:#ff2e97; --accent2:#7b5cff; --accent-text:#fff;
+    --ok-bg:#243a3a; --ok-text:#3affc8; --bad-bg:#4a2030; --bad-text:#ff6f9d;
+    --warn-bg:#3a3320; --warn-text:#ffd86b; --msg-bg:#2a1f4a; --msg-border:#4a3470; --shadow:rgba(255,46,151,.18); }
+  [data-theme="light"]{ color-scheme:light; --bg:#eef1f6; --card:#ffffff; --card-border:#dde3ec; --card-hover:#b9c4d6;
+    --input-bg:#f6f8fc; --input-border:#d2dae6; --text:#1c2430; --dim:#5a6678; --faint:#8a95a6;
+    --accent:#3b6fe0; --accent2:#6b5cff; --accent-text:#fff;
+    --ok-bg:#d8f3e2; --ok-text:#1d7a45; --bad-bg:#fbe0e0; --bad-text:#c0392b;
+    --warn-bg:#fcf0d0; --warn-text:#8a6d1a; --msg-bg:#e2ecff; --msg-border:#c3d6f7; --shadow:rgba(20,30,50,.12); }
+
+  body{ font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; max-width:820px; margin:0 auto;
+        padding:0 1rem 2rem; background:var(--bg); color:var(--text); line-height:1.5; -webkit-font-smoothing:antialiased; }
+  body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:radial-gradient(1100px 600px at 50% -240px, color-mix(in srgb,var(--accent) 16%,transparent), transparent 70%); }
+  ::selection{ background:color-mix(in srgb,var(--accent) 45%,transparent); }
+  h1{ font-size:1.35rem; margin:0; letter-spacing:.01em; }
+  h2{ font-size:1.02rem; margin:0 0 .6rem; color:var(--text); font-weight:600; display:flex; align-items:center; gap:.5rem; }
+  a{ color:var(--accent); text-decoration:none; } a:hover{ text-decoration:underline; }
+  code{ background:var(--input-bg); border:1px solid var(--input-border); border-radius:5px; padding:.05rem .35rem; font-size:.82em; }
+
+  .topbar{ position:sticky; top:0; z-index:30; display:flex; align-items:center; gap:1rem; margin:0 -1rem 1.2rem;
+    padding:.85rem 1rem; background:color-mix(in srgb,var(--bg) 82%,transparent); backdrop-filter:blur(12px);
+    border-bottom:1px solid var(--card-border); }
+  .topbar h1{ flex:1; }
+  .swatchbar{ display:flex; gap:.45rem; align-items:center; }
+  .swatch{ width:22px; height:22px; min-width:0; padding:0; border-radius:50%; cursor:pointer; background:var(--sw,#888);
+    border:2px solid transparent; box-shadow:0 1px 4px var(--shadow); transition:transform .12s ease, border-color .12s; }
+  .swatch:hover{ transform:scale(1.18); filter:none; }
+  .swatch.active{ border-color:var(--text); transform:scale(1.1); }
+
+  .card{ background:var(--card); border:1px solid var(--card-border); border-radius:var(--radius); padding:1.15rem 1.3rem;
+    margin:1.1rem 0; box-shadow:0 2px 12px var(--shadow); transition:border-color .2s; }
+  .card:hover{ border-color:var(--card-hover); }
+
+  /* Collapsible sections (set up by JS at load — collapsed by default). */
+  .card>h2.card-h2{ cursor:pointer; user-select:none; display:flex; align-items:center; gap:.5rem; }
+  .card-caret{ display:inline-block; font-size:.7em; opacity:.6; transition:transform .15s; }
+  .card:not(.collapsed)>h2.card-h2 .card-caret{ transform:rotate(90deg); }
+  .card.collapsed>.card-body{ display:none; }
+  /* A lone toggle stays in the header so it works while the section is collapsed. */
+  .hdr-switch{ margin-left:auto; }
+  .hdr-switch label{ margin:0; color:var(--text); }
+
+  label{ display:block; margin:.75rem 0 .25rem; font-size:.8rem; color:var(--dim); font-weight:500; }
+  input,select,textarea{ width:100%; box-sizing:border-box; background:var(--input-bg); color:var(--text);
+    border:1px solid var(--input-border); border-radius:9px; padding:.55rem .65rem; font-size:.9rem; font-family:inherit;
+    transition:border-color .15s, box-shadow .15s; }
+  input:focus,select:focus,textarea:focus{ outline:none; border-color:var(--accent);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent); }
+  textarea{ min-height:96px; resize:vertical; line-height:1.5; }
+  select{ appearance:none; -webkit-appearance:none; cursor:pointer; padding-right:2rem; background-repeat:no-repeat;
+    background-position:right .75rem center;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%23888' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+
+  input[type="checkbox"]{ appearance:none; -webkit-appearance:none; position:relative; flex:0 0 auto; width:44px !important;
+    height:24px; padding:0; border:none; border-radius:999px; cursor:pointer; background:var(--input-border);
+    transition:background .2s; vertical-align:middle; box-shadow:none; }
+  input[type="checkbox"]::after{ content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%;
+    background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.4); transition:transform .2s; }
+  input[type="checkbox"]:checked{ background:var(--accent); }
+  input[type="checkbox"]:checked::after{ transform:translateX(20px); }
+  input[type="checkbox"]:focus-visible{ outline:none; box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 30%,transparent); }
+
+  input[type="range"]{ -webkit-appearance:none; appearance:none; height:8px; padding:0; border:none; border-radius:999px;
+    background:var(--input-border); cursor:pointer; }
+  input[type="range"]::-webkit-slider-thumb{ -webkit-appearance:none; width:20px; height:20px; border-radius:50%;
+    background:var(--accent); border:3px solid var(--card); box-shadow:0 0 0 1px var(--accent); cursor:pointer; }
+  input[type="range"]::-moz-range-thumb{ width:16px; height:16px; border-radius:50%; background:var(--accent);
+    border:3px solid var(--card); cursor:pointer; }
+
+  button{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--accent-text); border:0;
+    border-radius:9px; padding:.55rem 1.05rem; font-size:.9rem; font-weight:600; cursor:pointer; font-family:inherit;
+    box-shadow:0 2px 8px var(--shadow); transition:transform .08s, filter .2s, box-shadow .2s; }
+  button:hover{ transform:translateY(-1px); filter:brightness(1.08); box-shadow:0 5px 16px var(--shadow); }
+  button:active{ transform:translateY(0); filter:brightness(.98); }
+  button.secondary{ background:var(--input-bg); color:var(--text); border:1px solid var(--input-border); box-shadow:none; }
+  button.secondary:hover{ background:var(--card); border-color:var(--accent); filter:none; }
+  button.danger{ background:linear-gradient(135deg,#e25a4d,#b3402f); color:#fff; }
+
+  .pill{ display:inline-flex; align-items:center; gap:.3rem; padding:.2rem .65rem; border-radius:999px; font-size:.76rem; font-weight:600; }
+  .on{ background:var(--ok-bg); color:var(--ok-text); } .off{ background:var(--bad-bg); color:var(--bad-text); }
+  .msg{ background:var(--msg-bg); border:1px solid var(--msg-border); padding:.7rem 1rem; border-radius:10px; margin:.4rem 0 1rem; font-size:.9rem; }
+  .btns{ display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.8rem; }
+  .hint{ font-size:.78rem; color:var(--faint); margin-top:.35rem; line-height:1.5; }
+  .row{ display:flex; gap:1rem; flex-wrap:wrap; } .row>div{ flex:1 1 180px; }
+
+  .vbar{ position:relative; height:18px; border-radius:999px; background:var(--input-bg);
+    border:1px solid var(--input-border); overflow:hidden; margin-top:.2rem; }
+  .vfill{ height:100%; width:0; border-radius:999px; transition:width .25s ease, background .25s; }
+  .vbar.stack{ display:flex; }
+  .vbar.stack .vseg{ height:100%; width:0; flex:0 0 auto; transition:width .25s ease, background .25s; }
+  .vsw{ display:inline-block; width:.7rem; height:.7rem; border-radius:3px; vertical-align:middle; margin-right:.15rem; }
+  .vbar-scale{ display:flex; justify-content:space-between; font-size:.7rem; color:var(--faint); margin-top:.2rem; }
+
+  .savebar{ position:sticky; bottom:0; z-index:20; display:flex; gap:.6rem; flex-wrap:wrap; margin:1.2rem -1rem 0;
+    padding:.85rem 1rem; background:color-mix(in srgb,var(--bg) 85%,transparent); backdrop-filter:blur(10px);
+    border-top:1px solid var(--card-border); }
+  .savebar button{ flex:0 0 auto; }
+
+  ::-webkit-scrollbar{ width:11px; height:11px; }
+  ::-webkit-scrollbar-thumb{ background:var(--card-border); border-radius:999px; border:3px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover{ background:var(--card-hover); }
 </style></head><body>
-<h1>🎙️ Voice Assistant</h1>
+<div class="topbar">
+  <h1>🎙️ Voice Assistant</h1>
+  <div class="swatchbar" id="themeBar"></div>
+</div>
 {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
 
 <div class="card">
-  <h2 style="margin-top:0">Status</h2>
+  <h2 style="margin-top:0">⚡ Status</h2>
   {% set active = state.active == 'active' %}
   Service: <span class="pill {{ 'on' if active else 'off' }}">{{ state.active }}</span>
   &nbsp; Run on startup:
@@ -659,12 +1544,12 @@ PAGE = """<!doctype html>
 
 <form method="post" action="/save">
 <div class="card">
-  <h2 style="margin-top:0">Pre-prompt (system prompt)</h2>
+  <h2 style="margin-top:0">📝 Pre-prompt (system prompt)</h2>
   <textarea name="system_prompt">{{ s.system_prompt or '' }}</textarea>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Wake word &amp; speech</h2>
+  <h2 style="margin-top:0">👂 Wake word &amp; speech</h2>
   <label>Speech input</label>
   <select name="stt_mode">
     {% for m in stt_modes %}
@@ -720,7 +1605,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Sleep mode</h2>
+  <h2 style="margin-top:0">😴 Sleep mode</h2>
   <div class="row">
     <div><label>Sleep command</label><input name="sleep_command" value="{{ s.sleep_command or 'go to sleep' }}"></div>
     <div><label>Wake command</label><input name="wake_command" value="{{ s.wake_command or 'wake up' }}"></div>
@@ -734,7 +1619,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Conversation flow</h2>
+  <h2 style="margin-top:0">💬 Conversation flow</h2>
   <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
     <input type="checkbox" name="followup_mode" value="1" style="width:auto"
            {{ 'checked' if s.get('followup_mode', True) else '' }}>
@@ -752,7 +1637,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Screen viewing</h2>
+  <h2 style="margin-top:0">🖥️ Screen viewing</h2>
   <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
     <input type="checkbox" name="screen_view" value="1" style="width:auto"
            {{ 'checked' if s.get('screen_view', True) else '' }}>
@@ -770,7 +1655,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Side panel</h2>
+  <h2 style="margin-top:0">📑 Side panel</h2>
   <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
     <input type="checkbox" name="side_panel" value="1" style="width:auto"
            {{ 'checked' if s.get('side_panel', True) else '' }}>
@@ -782,7 +1667,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Status orb</h2>
+  <h2 style="margin-top:0">🔮 Status orb</h2>
   <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
     <input type="checkbox" name="overlay" value="1" style="width:auto"
            {{ 'checked' if s.get('overlay', True) else '' }}>
@@ -791,7 +1676,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Voice (text-to-speech)</h2>
+  <h2 style="margin-top:0">🔊 Voice (text-to-speech)</h2>
   <label>Engine</label>
   <select name="tts_engine" id="ttsEngine" onchange="updateVoiceOpts()">
     {% for e in tts_engines %}
@@ -815,16 +1700,16 @@ PAGE = """<!doctype html>
     </div>
   </div>
 
-  <div class="row" id="neuttsOpts">
+  <div class="row" id="cloneOpts">
     <div>
-      <label>NeuTTS voice (cloned reference)</label>
+      <label>Cloned voice (NeuTTS / Chatterbox)</label>
       <select name="neutts_voice">
         {% for v in neutts_voices %}
         <option value="{{ v }}" {{ 'selected' if (s.neutts_voice or 'jo')==v else '' }}>{{ v }}</option>
         {% endfor %}
       </select>
     </div>
-    <div>
+    <div id="neuttsModelOpt">
       <label>NeuTTS model</label>
       <select name="neutts_backbone">
         {% for b in neutts_backbones %}
@@ -834,28 +1719,68 @@ PAGE = """<!doctype html>
       </select>
     </div>
   </div>
-  <div id="neuttsUpload">
-    <p class="hint">NeuTTS Air <b>clones the reference voice</b> you give it — quality depends entirely on
-       the clip. The bundled <b>jo</b>/<b>dave</b> are casual samples. For a great voice, upload a clean
-       <b>mono WAV, ~5–15s</b>, of the voice you want (calm, clear, no music/noise). It's auto-transcribed
-       and added to the voice list above. Try the <b>q8</b> model for higher quality. Applies on the next restart.</p>
+  <div id="chatterboxOpts">
+    <p class="hint">Chatterbox runs on the <b>GPU</b> and clones the voice selected above. Tune its delivery:</p>
+    <div class="row">
+      <div>
+        <label>Expressiveness: <b id="cbExagLabel">{{ '%.2f'|format(s.chatterbox_exaggeration or 0.5) }}</b></label>
+        <input type="range" name="chatterbox_exaggeration" min="0.25" max="1.0" step="0.05"
+               value="{{ s.chatterbox_exaggeration or 0.5 }}"
+               oninput="document.getElementById('cbExagLabel').textContent=(+this.value).toFixed(2)">
+      </div>
+      <div>
+        <label>Pace / CFG: <b id="cbCfgLabel">{{ '%.2f'|format(s.chatterbox_cfg or 0.5) }}</b></label>
+        <input type="range" name="chatterbox_cfg" min="0.2" max="1.0" step="0.05"
+               value="{{ s.chatterbox_cfg or 0.5 }}"
+               oninput="document.getElementById('cbCfgLabel').textContent=(+this.value).toFixed(2)">
+      </div>
+      <div>
+        <label>Temperature: <b id="cbTempLabel">{{ '%.2f'|format(s.chatterbox_temperature or 0.8) }}</b></label>
+        <input type="range" name="chatterbox_temperature" min="0.1" max="1.5" step="0.05"
+               value="{{ s.chatterbox_temperature or 0.8 }}"
+               oninput="document.getElementById('cbTempLabel').textContent=(+this.value).toFixed(2)">
+      </div>
+    </div>
+    <p class="hint">Higher expressiveness = more emotion; lower CFG = slower, calmer. Applies on the next restart.</p>
+    <div id="cbVramBox" style="margin-top:.8rem">
+      <label style="display:flex; justify-content:space-between; align-items:center; gap:.5rem;">
+        <span>GPU VRAM — model <b id="cbModelGb">—</b> + Chatterbox <b id="cbCbGb">—</b> = <b id="cbTotalGb">—</b></span>
+        <span id="cbVerdict" class="pill" style="display:none"></span></label>
+      <div class="vbar stack">
+        <div class="vseg" id="cbModelSeg" style="background:var(--accent)"></div>
+        <div class="vseg" id="cbCbSeg" style="background:#a371f7"></div>
+      </div>
+      <div class="vbar-scale"><span>0</span><span id="cbTotalScale"></span></div>
+      <p class="hint" style="margin-top:.35rem">
+        <i class="vsw" style="background:var(--accent)"></i> Language model
+        &nbsp;&nbsp;<i class="vsw" style="background:#a371f7"></i> Chatterbox TTS
+        <span id="cbVramNote"></span></p>
+    </div>
+  </div>
+  <div id="cloneUpload">
+    <p class="hint"><b>NeuTTS</b> and <b>Chatterbox</b> both <b>clone the reference voice</b> you upload — quality
+       depends on the clip. For a great voice, upload a clean <b>mono clip, ~10–15s</b> (calm, clear, no
+       music/noise). It's auto-trimmed to the usable length, transcribed, and added to the voice list above.
+       Applies on the next restart.</p>
     <div class="row">
       <div><label>New voice name</label><input type="text" id="refName" placeholder="e.g. sophon"></div>
-      <div><label>Reference WAV</label><input type="file" id="refFile" accept=".wav,audio/wav"></div>
+      <div><label>Reference audio</label><input type="file" id="refFile" accept="audio/*,.wav,.mp3,.m4a,.flac"></div>
       <div style="display:flex; align-items:flex-end;">
-        <button type="button" class="secondary" onclick="uploadRef()">⬆ Upload &amp; transcribe</button></div>
+        <button type="button" class="secondary" onclick="uploadRef()">⬆ Upload &amp; add voice</button></div>
     </div>
     <p class="hint" id="refMsg"></p>
   </div>
   <script>
     function updateVoiceOpts(){
       var e = document.getElementById('ttsEngine').value;
-      var k = document.getElementById('kokoroOpts');
-      var n = document.getElementById('neuttsOpts');
-      var u = document.getElementById('neuttsUpload');
-      if (k) k.style.display = (e === 'kokoro') ? '' : 'none';
-      if (n) n.style.display = (e === 'neutts') ? '' : 'none';
-      if (u) u.style.display = (e === 'neutts') ? '' : 'none';
+      var cloned = (e === 'neutts' || e === 'chatterbox');   // both clone a reference voice
+      function show(id, on){ var x=document.getElementById(id); if(x) x.style.display = on ? '' : 'none'; }
+      show('kokoroOpts', e === 'kokoro');
+      show('cloneOpts', cloned);            // shared cloned-voice selector
+      show('neuttsModelOpt', e === 'neutts'); // q4/q8 is NeuTTS-only
+      show('chatterboxOpts', e === 'chatterbox');
+      show('cloneUpload', cloned);
+      if(typeof updateCbVram === 'function') updateCbVram();   // refresh the VRAM bar
     }
     async function uploadRef(){
       var name = document.getElementById('refName').value.trim();
@@ -886,7 +1811,7 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Skills (tools)</h2>
+  <h2 style="margin-top:0">🧰 Skills (tools)</h2>
   <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
     <input type="checkbox" name="skills" value="1" style="width:auto"
            {{ 'checked' if s.get('skills', True) else '' }}>
@@ -912,30 +1837,96 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">LLM connection</h2>
+  <h2 style="margin-top:0">📁 File access (read-only)</h2>
+  <label style="display:flex; align-items:center; gap:.5rem; margin:.2rem 0;">
+    <input type="checkbox" name="file_access" value="1" style="width:auto"
+           {{ 'checked' if s.get('file_access', False) else '' }}>
+    Let Cleo read files on this machine
+  </label>
+  <p class="hint">When on, Cleo can read files and list folders — but <b>only</b> inside the folders
+     you list below, and never anything on the blocked list. It's strictly read-only (she can't
+     write, move, or delete). With no allowed folders set, nothing is readable.</p>
+
+  <label>Allowed folders / files (one per line)</label>
+  <textarea name="file_access_roots" placeholder="/home/briley/Documents&#10;/home/briley/notes.txt"
+            style="min-height:78px; font-family:ui-monospace,monospace; font-size:.82rem">{{ (s.file_access_roots or []) | join('\\n') }}</textarea>
+  <p class="hint">Absolute paths. A folder grants access to everything beneath it. <code>~</code> and
+     <code>$VARS</code> are expanded. Symlinks are resolved before checking, so a link can't reach
+     outside these.</p>
+
+  <label>Blocked paths / patterns (one per line)</label>
+  <textarea name="file_access_blacklist"
+            style="min-height:120px; font-family:ui-monospace,monospace; font-size:.82rem">{{ (s.file_access_blacklist if s.file_access_blacklist is defined else file_blacklist_default) | join('\\n') }}</textarea>
+  <p class="hint">Hidden from Cleo even inside an allowed folder — for listings and reads alike.
+     A line with <code>*</code>, <code>?</code> or <code>[</code> is a glob (matched against the full
+     path and the bare filename, e.g. <code>*.env</code>, <code>*/.ssh/*</code>); anything else is a
+     literal file or folder to block. The defaults shield common secrets and Cleo's own settings —
+     edit as you like.</p>
+
+  <label>Max file size to read (KB)</label>
+  <input type="number" name="file_access_max_kb" min="1" max="4096" step="1"
+         value="{{ s.file_access_max_kb or 256 }}" style="max-width:10rem">
+  <p class="hint">Reads stop at this size so a huge file can't flood the model. Binary files are
+     refused outright. Changes apply on the next assistant restart.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">🧠 LLM connection</h2>
+  {% set selkey = s.llm_model or 'gemma4-12b' %}
   <label>Model</label>
-  <select name="llm_model">
+  <select name="llm_model" id="llmModel" onchange="onModelChange()">
     {% for key, label in llm_models %}
-    <option value="{{ key }}" {{ 'selected' if (s.llm_model or 'gemma4-12b')==key else '' }}>{{ label }}</option>
+    <option value="{{ key }}" {{ 'selected' if selkey==key else '' }}>{{ label }}</option>
     {% endfor %}
   </select>
   <p class="hint">Picks which model to run. Text-only models (e.g. Nemotron) automatically use
      Whisper for speech — native audio needs an audio-capable model like Gemma 4.</p>
+
+  <div id="quantRow" style="{{ '' if quant_data.get(selkey) and quant_data[selkey].quants else 'display:none' }}">
+    <label>Quantization</label>
+    <select name="llm_quant" id="llmQuant" onchange="onQuantChange()">
+      {% if quant_data.get(selkey) %}
+        {% for q in quant_data[selkey].quants %}
+        <option value="{{ q.name }}" {{ 'selected' if model_status.quant==q.name else '' }}>
+          {{ q.name }} — {{ q.gb }} GB{{ ' · downloaded' if q.present else '' }}</option>
+        {% endfor %}
+      {% endif %}
+    </select>
+    <p class="hint">Higher quant = better quality but more VRAM/RAM. The bar below estimates whether
+       the whole model fits on your GPU. After changing this, Download the quant and Save &amp; restart.</p>
+  </div>
+
+  <div id="vramBox" style="margin-top:.7rem; display:none">
+    <label style="margin-top:0; display:flex; align-items:center; gap:.5rem; flex-wrap:wrap">
+      Estimated VRAM <b id="vramNeed"></b>
+      <span id="vramVerdict" class="pill" style="display:none"></span></label>
+    <div class="vbar"><div class="vfill" id="vramFill"></div></div>
+    <div class="vbar-scale"><span>0</span><span id="vramTotal"></span></div>
+    <p class="hint" id="vramNote"></p>
+  </div>
+
   <div class="hint" style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap;">
-    {% if model_status.present %}
-      <span class="pill on">local file ready{% if model_status.size_gb %} · {{ model_status.size_gb }} GB{% endif %}</span>
-    {% elif model_status.downloading %}
-      <span class="pill" style="background:#3a3320;color:#e3c878">⬇ downloading… (see logs/model_download.log)</span>
-    {% else %}
-      <span class="pill off">no local file</span>
-    {% endif %}
-    {% if model_status.downloadable and not model_status.present and not model_status.downloading %}
-      <button type="submit" formaction="/download_model" class="secondary"
-              title="Download this model's GGUF from HuggingFace (several GB)">⬇ Download model</button>
-    {% endif %}
+    <span id="msPill" class="pill off">checking…</span>
+    <button type="button" id="dlBtn" class="secondary" style="display:none"
+            onclick="startDownload()" title="Download this GGUF from HuggingFace">⬇ Download</button>
+    <button type="button" id="delBtn" class="danger" style="display:none"
+            onclick="deleteModel()" title="Delete this local GGUF to free disk space">🗑 Delete</button>
+  </div>
+  <div id="dlProgress" style="display:none; margin-top:.5rem">
+    <div class="vbar"><div class="vfill" id="dlFill" style="background:var(--accent)"></div></div>
+    <div class="vbar-scale"><span id="dlText"></span><span id="dlPct"></span></div>
+  </div>
+  <div class="row" style="margin-top:.5rem; align-items:center;">
+    <input type="file" id="llmUploadFile" accept=".gguf" style="font-size:.8rem;">
+    <button type="button" class="secondary" onclick="uploadModel('llmUploadFile','/llm/upload','llmModel',onModelChange)">⬆ Upload GGUF</button>
+  </div>
+  <div id="llmUpProgress" style="display:none; margin-top:.4rem">
+    <div class="vbar"><div class="vfill" id="llmUpFill" style="background:var(--accent2)"></div></div>
+    <div class="vbar-scale"><span id="llmUpText"></span><span id="llmUpPct"></span></div>
   </div>
   <p class="hint">A local file is only needed for the <b>llama-cpp</b> backend. For Ollama use
-     <code>ollama pull</code>; for a remote model use the API backend below — neither needs a download.</p>
+     <code>ollama pull</code>; for a remote model use the API backend below — neither needs a download.
+     Or <b>upload your own .gguf</b> above — it appears as "Custom: …" in the model list (text-only, llama-cpp).</p>
   <label>Backend</label>
   <select name="llm_backend">
     {% for b in backends %}
@@ -965,6 +1956,13 @@ PAGE = """<!doctype html>
          oninput="document.getElementById('gpuPctLabel').textContent=this.value+'%'">
   <p class="hint">Caps the share of GPU <b>compute</b> (not VRAM) Cleo may use, via NVIDIA MPS —
      only Cleo is throttled. 100% = no limit. Takes effect on the next assistant restart.</p>
+  <label>CPU compute limit: <b id="cpuPctLabel">{{ (s.cpu_compute_percent or 100) }}%</b></label>
+  <input type="range" name="cpu_compute_percent" min="10" max="100" step="5"
+         value="{{ s.cpu_compute_percent or 100 }}"
+         oninput="document.getElementById('cpuPctLabel').textContent=this.value+'%'">
+  <p class="hint">Caps the share of CPU <b>cores</b> Cleo may use when running a model on the CPU
+     (llama-cpp threads + OpenMP). Running a big model on all cores at once can hard-lock the
+     machine; this leaves cores free for the desktop. 100% = no limit. Takes effect on restart.</p>
   <div class="row">
     <div><label>Ollama host</label><input name="ollama_host" value="{{ s.ollama_host or '' }}"></div>
     <div><label>Ollama model (override — blank = model default)</label>
@@ -973,7 +1971,106 @@ PAGE = """<!doctype html>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">Remote API (OpenAI-compatible)</h2>
+  <h2 style="margin-top:0">🎨 Image connection</h2>
+  <label>Image model</label>
+  <select name="image_model" id="imageModel" onchange="onImageModelChange()">
+    {% for key, label in image_models %}
+    <option value="{{ key }}" {{ 'selected' if (s.image_model or 'none')==key else '' }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">Local Stable Diffusion (diffusers), running in its own venv just like the voice
+     models. Weights download from HuggingFace on first generation. "None" turns image generation
+     off. With a model selected, Cleo can draw images on request — and you can prompt directly on the
+     <a href="/image" target="_blank">image page</a> (works even with the language model set to None).</p>
+
+  <div class="row">
+    <div><label>Device</label>
+      <select name="image_device" id="imageDevice" onchange="refreshImageStatus()">
+        <option value="cuda" {{ 'selected' if (s.image_device or 'cuda')=='cuda' else '' }}>cuda (GPU)</option>
+        <option value="cpu" {{ 'selected' if s.image_device=='cpu' else '' }}>cpu (slow, no VRAM)</option>
+      </select>
+    </div>
+    <div><label>Working-set estimate</label>
+      <div id="imgVram" class="hint" style="margin-top:.55rem">—</div></div>
+  </div>
+
+  <div class="hint" style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; margin-top:.4rem;">
+    <span id="imgPill" class="pill off">checking…</span>
+    <button type="button" id="imgDlBtn" class="secondary" style="display:none"
+            onclick="downloadImageModel()" title="Download this model's weights from HuggingFace">⬇ Download</button>
+    <a href="/image" target="_blank"><button type="button" class="secondary">🎨 Open image page</button></a>
+  </div>
+  <div id="imgDlProgress" style="display:none; margin-top:.5rem">
+    <div class="vbar"><div class="vfill" id="imgDlFill" style="background:var(--accent)"></div></div>
+    <div class="vbar-scale"><span id="imgDlText"></span><span id="imgDlPct"></span></div>
+  </div>
+  <p class="hint" id="imgSetupNote" style="display:none">
+     The image venv isn't installed yet — run <code>bash imagegen/setup_imagegen.sh</code> to create it
+     (needed to <i>generate</i>; downloading weights works without it).</p>
+  <div class="row" style="margin-top:.5rem; align-items:center;">
+    <input type="file" id="imgUploadFile" accept=".safetensors,.ckpt" style="font-size:.8rem;">
+    <button type="button" class="secondary" onclick="uploadModel('imgUploadFile','/image/upload','imageModel',onImageModelChange)">⬆ Upload checkpoint</button>
+  </div>
+  <div id="imgUpProgress" style="display:none; margin-top:.4rem">
+    <div class="vbar"><div class="vfill" id="imgUpFill" style="background:var(--accent2)"></div></div>
+    <div class="vbar-scale"><span id="imgUpText"></span><span id="imgUpPct"></span></div>
+  </div>
+  <p class="hint">Upload your own Stable Diffusion checkpoint (<code>.safetensors</code>/<code>.ckpt</code>) —
+     it appears as "Custom: …". Put "xl" in the filename for SDXL checkpoints so it renders at 1024px.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">🎬 Video connection</h2>
+  <label>Video model</label>
+  <select name="video_model" id="videoModel" onchange="onVideoModelChange()">
+    {% for key, label in video_models %}
+    <option value="{{ key }}" {{ 'selected' if (s.video_model or 'none')==key else '' }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">Local text-to-video (diffusers: Wan, LTX-2, …), in its own venv. Weights download from
+     HuggingFace on first generation. "None" turns video off. With a model selected, Cleo can make
+     short clips on request, and you can prompt directly on the
+     <a href="/video" target="_blank">video page</a>. Video is slow and VRAM-heavy — Wan 1.3B / LTX
+     fit ~16 GB; the 14B models need 24 GB+.</p>
+
+  <div class="row">
+    <div><label>Device</label>
+      <select name="video_device" id="videoDevice" onchange="refreshVideoStatus()">
+        <option value="cuda" {{ 'selected' if (s.video_device or 'cuda')=='cuda' else '' }}>cuda (GPU)</option>
+        <option value="cpu" {{ 'selected' if s.video_device=='cpu' else '' }}>cpu (very slow, no VRAM)</option>
+      </select>
+    </div>
+    <div><label>Working-set estimate</label>
+      <div id="vidVram" class="hint" style="margin-top:.55rem">—</div></div>
+  </div>
+
+  <div class="hint" style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; margin-top:.4rem;">
+    <span id="vidPill" class="pill off">checking…</span>
+    <button type="button" id="vidDlBtn" class="secondary" style="display:none"
+            onclick="downloadVideoModel()" title="Download this model's weights from HuggingFace">⬇ Download</button>
+    <a href="/video" target="_blank"><button type="button" class="secondary">🎬 Open video page</button></a>
+  </div>
+  <div id="vidDlProgress" style="display:none; margin-top:.5rem">
+    <div class="vbar"><div class="vfill" id="vidDlFill" style="background:var(--accent)"></div></div>
+    <div class="vbar-scale"><span id="vidDlText"></span><span id="vidDlPct"></span></div>
+  </div>
+  <p class="hint" id="vidSetupNote" style="display:none">
+     The video venv isn't installed yet — run <code>bash video/setup_video.sh</code> to create it
+     (needed to <i>generate</i>; downloading weights works without it).</p>
+  <div class="row" style="margin-top:.5rem; align-items:center;">
+    <input type="file" id="vidUploadFile" accept=".safetensors,.ckpt" style="font-size:.8rem;">
+    <button type="button" class="secondary" onclick="uploadModel('vidUploadFile','/video/upload','videoModel',onVideoModelChange)">⬆ Upload checkpoint</button>
+  </div>
+  <div id="vidUpProgress" style="display:none; margin-top:.4rem">
+    <div class="vbar"><div class="vfill" id="vidUpFill" style="background:var(--accent2)"></div></div>
+    <div class="vbar-scale"><span id="vidUpText"></span><span id="vidUpPct"></span></div>
+  </div>
+  <p class="hint">Upload your own video checkpoint (<code>.safetensors</code>/<code>.ckpt</code>) —
+     it appears as "Custom: …" (single-file loading is best-effort for video models).</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">🌐 Remote API (OpenAI-compatible)</h2>
   <label>Base URL</label>
   <input name="api_base_url" placeholder="https://api.openai.com/v1" value="{{ s.api.base_url if s.api else '' }}">
   <div class="row">
@@ -984,9 +2081,9 @@ PAGE = """<!doctype html>
   <p class="hint">Key is stored locally in settings.json on this machine.</p>
 </div>
 
-<div class="btns">
-  <button type="submit">Save</button>
-  <button type="submit" name="restart" value="1" class="secondary">Save &amp; restart assistant</button>
+<div class="savebar">
+  <button type="submit">💾 Save settings</button>
+  <button type="submit" name="restart" value="1" class="secondary">💾 Save &amp; restart assistant</button>
 </div>
 </form>
 
@@ -1026,56 +2123,557 @@ async function pollEnroll(){
   } catch(e){ promptEl.textContent = 'Lost contact with the panel: ' + e; }
   enrolling = false; btn.disabled = false; btn.textContent = '🎤 Train to my voice';
 }
+
+// --- Themes ---
+const THEMES = [['midnight','Midnight','#4d7cff'],['nord','Nord','#88c0d0'],
+  ['dracula','Dracula','#bd93f9'],['emerald','Emerald','#2dd4a7'],
+  ['synthwave','Synthwave','#ff2e97'],['light','Light','#3b6fe0']];
+function applyTheme(t){
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('cleo_theme', t); } catch(e){}
+  document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', s.dataset.t === t));
+}
+function initThemes(){
+  const bar = document.getElementById('themeBar');
+  if (bar) bar.innerHTML = THEMES.map(([id,n,c]) =>
+    '<button type="button" class="swatch" data-t="'+id+'" title="'+n+'" style="--sw:'+c
+    +'" onclick="applyTheme(\\''+id+'\\')"></button>').join('');
+  let s = 'midnight';
+  try { s = localStorage.getItem('cleo_theme') || 'midnight'; } catch(e){}
+  applyTheme(s);
+}
+initThemes();
+
+// --- Model quant picker + VRAM-fit bar ---
+const QUANT_DATA = {{ quant_data|tojson }};
+const GPU_TOTAL_GB = {{ gpu_total_gb if gpu_total_gb is not none else 'null' }};
+const CHATTERBOX_VRAM_GB = {{ chatterbox_vram_gb }};
+// Chatterbox runs on the GPU on top of the language model; show the stacked VRAM
+// when it's the selected TTS engine so the user can see if both fit.
+function updateCbVram(){
+  const box = document.getElementById('cbVramBox');
+  if(!box) return;
+  const eng = (document.getElementById('ttsEngine')||{}).value;
+  if(eng !== 'chatterbox'){ box.style.display='none'; return; }
+  box.style.display='';
+  const model = modelVramGb() || 0;
+  const cb = CHATTERBOX_VRAM_GB;
+  const total = Math.round((model + cb)*10)/10;
+  document.getElementById('cbModelGb').textContent = '~'+model+' GB';
+  document.getElementById('cbCbGb').textContent = '~'+cb+' GB';
+  document.getElementById('cbTotalGb').textContent = '~'+total+' GB';
+  const mSeg = document.getElementById('cbModelSeg');
+  const cSeg = document.getElementById('cbCbSeg');
+  const verdict = document.getElementById('cbVerdict');
+  const note = document.getElementById('cbVramNote');
+  const scale = document.getElementById('cbTotalScale');
+  if(GPU_TOTAL_GB == null){
+    mSeg.style.width='0%'; cSeg.style.width='0%';
+    verdict.style.display='none'; scale.textContent='no GPU';
+    note.textContent = ' — no NVIDIA GPU detected; Chatterbox needs a GPU (or set its device to CPU).';
+    return;
+  }
+  scale.textContent = GPU_TOTAL_GB+' GB';
+  mSeg.style.width = Math.round(model/GPU_TOTAL_GB*100)+'%';   // overflow is clipped by .vbar
+  cSeg.style.width = Math.round(cb/GPU_TOTAL_GB*100)+'%';
+  const fits = total <= GPU_TOTAL_GB;
+  const tight = fits && total > GPU_TOTAL_GB*0.9;
+  verdict.style.display='';
+  verdict.textContent = !fits ? 'too big for GPU' : (tight ? 'tight fit' : 'fits on GPU');
+  verdict.style.background = !fits ? 'var(--bad-bg)' : (tight ? 'var(--warn-bg)' : 'var(--ok-bg)');
+  verdict.style.color = !fits ? 'var(--bad-text)' : (tight ? 'var(--warn-text)' : 'var(--ok-text)');
+  note.textContent = fits
+    ? (' — model + Chatterbox together need ~'+total+' GB of '+GPU_TOTAL_GB+' GB.')
+    : (' — together they exceed VRAM (~'+total+' GB vs '+GPU_TOTAL_GB+' GB); lower the LLM quant or run one on CPU.');
+}
+function onModelChange(){
+  // Rebuild the quant options for the newly-selected model (defaulting to the
+  // model's default quant), then recompute the bar.
+  const key = document.getElementById('llmModel').value;
+  const sel = document.getElementById('llmQuant');
+  const row = document.getElementById('quantRow');
+  const d = QUANT_DATA[key];
+  if(!d || !d.quants || !d.quants.length){ row.style.display='none'; sel.innerHTML=''; computeVram(); refreshModelStatus(); return; }
+  row.style.display='';
+  sel.innerHTML = d.quants.map(q =>
+    '<option value="'+q.name+'">'+q.name+' — '+q.gb+' GB'+(q.present?' · downloaded':'')+'</option>').join('');
+  const def = d.quants.find(q=>q.def) || d.quants[0];
+  sel.value = def.name;
+  computeVram();
+  refreshModelStatus();
+}
+function onQuantChange(){ computeVram(); refreshModelStatus(); }
+function modelVramGb(){
+  // Estimated VRAM (GB) the selected model+quant needs fully on the GPU, or null.
+  const d = QUANT_DATA[document.getElementById('llmModel').value];
+  if(!d) return null;
+  let sizeGb = null;
+  if(d.quants && d.quants.length){
+    const q = d.quants.find(x => x.name === document.getElementById('llmQuant').value);
+    sizeGb = q ? q.gb : null;
+  } else { sizeGb = d.file_gb; }
+  if(sizeGb == null) return null;
+  return Math.round((sizeGb + (d.overhead_gb||0) + (d.native ? (d.mmproj_gb||0) : 0))*10)/10;
+}
+function computeVram(){ computeVramCore(); updateCbVram(); }
+function computeVramCore(){
+  const box = document.getElementById('vramBox');
+  const need = modelVramGb();
+  if(need == null){ box.style.display='none'; return; }   // size unknown (single-file, not downloaded)
+  box.style.display='';
+  document.getElementById('vramNeed').textContent = '~'+need+' GB';
+  const fill = document.getElementById('vramFill');
+  const verdict = document.getElementById('vramVerdict');
+  const note = document.getElementById('vramNote');
+  const totalEl = document.getElementById('vramTotal');
+  if(GPU_TOTAL_GB == null){
+    fill.style.width='0%'; verdict.style.display='none'; totalEl.textContent='no GPU';
+    note.textContent = 'No NVIDIA GPU detected — the model runs on CPU + RAM, needing about '+need+' GB of RAM.';
+    return;
+  }
+  totalEl.textContent = GPU_TOTAL_GB+' GB';
+  verdict.style.display='';
+  fill.style.width = Math.min(100, Math.round(need/GPU_TOTAL_GB*100))+'%';
+  const fits = need <= GPU_TOTAL_GB;
+  const tight = fits && need > GPU_TOTAL_GB*0.9;
+  fill.style.background = !fits ? '#e25a4d' : (tight ? '#e3a008' : '#3fb950');
+  verdict.textContent = !fits ? 'too big for GPU' : (tight ? 'tight fit' : 'fits on GPU');
+  verdict.style.background = !fits ? 'var(--bad-bg)' : (tight ? 'var(--warn-bg)' : 'var(--ok-bg)');
+  verdict.style.color = !fits ? 'var(--bad-text)' : (tight ? 'var(--warn-text)' : 'var(--ok-text)');
+  note.textContent = fits
+    ? ('Should fit fully on the GPU (~'+need+' GB of '+GPU_TOTAL_GB+' GB). Other apps using VRAM '
+       + 'cut into free space; the "auto" device falls back to CPU if free VRAM is short at launch.')
+    : ('Likely too big to fully offload (~'+need+' GB needed vs '+GPU_TOTAL_GB+' GB total). It will '
+       + 'run partly or fully on CPU + RAM — or set GPU layers below for a partial offload.');
+}
+
+// --- Live model status (present / download progress / delete), no page reload ---
+let dlPollTimer = null;
+function curModel(){ return document.getElementById('llmModel').value; }
+function curQuant(){
+  const row = document.getElementById('quantRow');
+  const sel = document.getElementById('llmQuant');
+  return (sel && row.style.display !== 'none') ? sel.value : '';
+}
+async function refreshModelStatus(){
+  const key = curModel(), quant = curQuant();
+  let d;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);   // don't hang forever
+    const resp = await fetch('/model_status.json?key='+encodeURIComponent(key)
+                           +'&quant='+encodeURIComponent(quant),
+                           {cache:'no-store', signal: ctl.signal});
+    clearTimeout(t);
+    d = await resp.json();
+  } catch(e){
+    // A failed/slow check must NOT leave the pill stuck on "checking…" forever:
+    // show that the check didn't complete and retry, so it self-heals.
+    if (curModel() === key){
+      const pill = document.getElementById('msPill');
+      pill.className = 'pill off'; pill.style.background = ''; pill.style.color = '';
+      pill.textContent = 'status unavailable — retrying…';
+    }
+    clearTimeout(dlPollTimer);
+    dlPollTimer = setTimeout(refreshModelStatus, 3000);
+    return;
+  }
+  if (curModel() !== key) return;                 // selection changed mid-fetch
+  const pill = document.getElementById('msPill');
+  const dlBtn = document.getElementById('dlBtn');
+  const delBtn = document.getElementById('delBtn');
+  const prog = document.getElementById('dlProgress');
+  clearTimeout(dlPollTimer);
+  if (d.none){
+    prog.style.display = 'none';
+    pill.className = 'pill off'; pill.style.background = ''; pill.style.color = '';
+    pill.textContent = 'no language model — image-only mode';
+    dlBtn.style.display = 'none'; delBtn.style.display = 'none';
+    return;
+  }
+  if (d.downloading){
+    pill.className = 'pill'; pill.style.background = 'var(--warn-bg)'; pill.style.color = 'var(--warn-text)';
+    pill.textContent = '⬇ downloading…' + (d.quant ? (' ' + d.quant) : '');
+    dlBtn.style.display = 'none'; delBtn.style.display = 'none';
+    prog.style.display = '';
+    const fill = document.getElementById('dlFill');
+    if (d.pct != null){ fill.style.opacity = '1'; fill.style.width = d.pct + '%';
+                        document.getElementById('dlPct').textContent = d.pct + '%'; }
+    else { fill.style.opacity = '.4'; fill.style.width = '100%';
+           document.getElementById('dlPct').textContent = ''; }
+    document.getElementById('dlText').textContent =
+      (d.downloaded_gb != null ? d.downloaded_gb + ' GB' : '') + (d.total_gb ? (' / ' + d.total_gb + ' GB') : '');
+    dlPollTimer = setTimeout(refreshModelStatus, 1200);
+    return;
+  }
+  prog.style.display = 'none';
+  pill.style.background = ''; pill.style.color = '';
+  if (d.present){
+    pill.className = 'pill on';
+    pill.textContent = (d.custom ? 'uploaded' : 'local file ready')
+      + (d.quant ? (' · ' + d.quant) : '') + (d.size_gb ? (' · ' + d.size_gb + ' GB') : '');
+    dlBtn.style.display = 'none';
+    delBtn.style.display = d.custom ? 'none' : '';   // /delete_model only knows registry models
+  } else {
+    pill.className = 'pill off';
+    pill.textContent = 'no local file' + (d.quant ? (' · ' + d.quant) : '');
+    dlBtn.style.display = d.downloadable ? '' : 'none';
+    delBtn.style.display = 'none';
+  }
+}
+async function startDownload(){
+  const fd = new FormData();
+  fd.append('llm_model', curModel());
+  if (curQuant()) fd.append('llm_quant', curQuant());
+  fd.append('json', '1');
+  const pill = document.getElementById('msPill');
+  pill.className = 'pill'; pill.textContent = 'starting…';
+  try { const r = await fetch('/download_model', {method:'POST', body: fd});
+        const j = await r.json().catch(()=>({}));
+        if (j.error){ alert('Download failed: ' + j.error); }
+  } catch(e){ alert('Download failed: ' + e); }
+  setTimeout(refreshModelStatus, 700);
+}
+async function deleteModel(){
+  const key = curModel(), quant = curQuant();
+  if (!confirm('Delete the local file for ' + key + (quant ? (' (' + quant + ')') : '')
+               + '? You can re-download it later.')) return;
+  const fd = new FormData(); fd.append('key', key); if (quant) fd.append('quant', quant);
+  try { const r = await fetch('/delete_model', {method:'POST', body: fd});
+        const j = await r.json().catch(()=>({}));
+        if (j.error){ alert('Delete failed: ' + j.error); }
+  } catch(e){ alert('Delete failed: ' + e); }
+  refreshModelStatus();
+}
+computeVram();
+refreshModelStatus();
+
+// --- Image connection (model status + VRAM hint) ---
+const IMAGE_META = {{ image_meta|tojson }};
+let imgPollTimer = null;
+function curImageModel(){ const el = document.getElementById('imageModel'); return el ? el.value : 'none'; }
+function updateImgVram(){
+  const box = document.getElementById('imgVram');
+  if (!box) return;
+  const meta = IMAGE_META[curImageModel()];
+  if (!meta || meta.vram == null){ box.textContent = '—'; return; }
+  let txt = '~'+meta.vram+' GB'+(meta.size ? (' · '+meta.size+'px') : '');
+  if (GPU_TOTAL_GB != null) txt += ' of '+GPU_TOTAL_GB+' GB'
+    + (meta.vram > GPU_TOTAL_GB ? ' — too big for GPU' : '');
+  box.textContent = txt;
+}
+function onImageModelChange(){ updateImgVram(); refreshImageStatus(); }
+async function refreshImageStatus(){
+  const pill = document.getElementById('imgPill');
+  const note = document.getElementById('imgSetupNote');
+  const dlBtn = document.getElementById('imgDlBtn');
+  const prog = document.getElementById('imgDlProgress');
+  if (!pill) return;
+  let d;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const resp = await fetch('/image/status.json?model='+encodeURIComponent(curImageModel()),
+                             {cache:'no-store', signal: ctl.signal});
+    clearTimeout(t);
+    d = await resp.json();
+  } catch(e){
+    pill.className = 'pill off'; pill.textContent = 'status unavailable — retrying…';
+    clearTimeout(imgPollTimer); imgPollTimer = setTimeout(refreshImageStatus, 3000); return;
+  }
+  clearTimeout(imgPollTimer);
+  pill.style.background = ''; pill.style.color = '';
+  dlBtn.style.display = 'none'; prog.style.display = 'none';
+  if (note) note.style.display = 'none';
+
+  if (!d.enabled){ pill.className = 'pill off'; pill.textContent = 'image generation off'; return; }
+
+  if (d.downloading){
+    pill.className = 'pill'; pill.style.background = 'var(--warn-bg)'; pill.style.color = 'var(--warn-text)';
+    pill.textContent = '⬇ downloading weights…';
+    prog.style.display = '';
+    const fill = document.getElementById('imgDlFill');
+    if (d.pct != null){ fill.style.opacity = '1'; fill.style.width = d.pct + '%';
+                        document.getElementById('imgDlPct').textContent = d.pct + '%'; }
+    else { fill.style.opacity = '.4'; fill.style.width = '100%'; document.getElementById('imgDlPct').textContent = ''; }
+    document.getElementById('imgDlText').textContent =
+      (d.downloaded_gb != null ? d.downloaded_gb + ' GB' : '') + (d.dl_gb ? (' / ~' + d.dl_gb + ' GB') : '');
+    imgPollTimer = setTimeout(refreshImageStatus, 1500);
+    return;
+  }
+  if (!d.downloaded){
+    pill.className = 'pill off';
+    pill.textContent = 'not downloaded' + (d.dl_gb ? (' · ~' + d.dl_gb + ' GB') : '');
+    dlBtn.style.display = '';
+    if (note && !d.installed) note.style.display = '';
+    return;
+  }
+  // Downloaded:
+  if (!d.installed){ pill.className = 'pill on'; pill.textContent = 'downloaded · venv not installed';
+                     if (note) note.style.display = ''; return; }
+  if (d.error){ pill.className = 'pill off'; pill.style.background='var(--bad-bg)'; pill.style.color='var(--bad-text)';
+                pill.textContent = 'load failed — see logs'; return; }
+  if (d.ready){ pill.className = 'pill on'; pill.textContent = 'model loaded ('+(d.device||'')+')'; return; }
+  if (d.loading){ pill.className = 'pill'; pill.style.background='var(--warn-bg)'; pill.style.color='var(--warn-text)';
+                  pill.textContent = 'loading model…'; imgPollTimer = setTimeout(refreshImageStatus, 2000); return; }
+  pill.className = 'pill on'; pill.textContent = 'downloaded · ready (loads on first image)';
+}
+async function downloadImageModel(){
+  const key = curImageModel();
+  if (key === 'none'){ alert('Select an image model first.'); return; }
+  const fd = new FormData(); fd.append('image_model', key);
+  const pill = document.getElementById('imgPill');
+  pill.className = 'pill'; pill.textContent = 'starting…';
+  try { const r = await fetch('/image/download', {method:'POST', body: fd});
+        const j = await r.json().catch(()=>({}));
+        if (j.error){ alert('Download failed: ' + j.error); } }
+  catch(e){ alert('Download failed: ' + e); }
+  setTimeout(refreshImageStatus, 700);
+}
+// Upload a custom model file (GGUF or SD checkpoint) with a live progress bar.
+function uploadModel(fileInputId, endpoint, selectId, onDone){
+  const inp = document.getElementById(fileInputId);
+  const file = inp && inp.files && inp.files[0];
+  if (!file){ alert('Choose a file first.'); return; }
+  const P = (selectId === 'llmModel') ? 'llmUp' : (selectId === 'videoModel') ? 'vidUp' : 'imgUp';
+  const prog = document.getElementById(P+'Progress');
+  const fill = document.getElementById(P+'Fill');
+  const text = document.getElementById(P+'Text');
+  const pct  = document.getElementById(P+'Pct');
+  prog.style.display = ''; fill.style.width = '0%'; pct.textContent = '0%';
+  text.textContent = 'uploading '+file.name+'…';
+  const fd = new FormData(); fd.append('file', file);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', endpoint);
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable){ const p = Math.round(e.loaded/e.total*100);
+      fill.style.width = p+'%'; pct.textContent = p+'%';
+      text.textContent = (e.loaded/1e9).toFixed(2)+' / '+(e.total/1e9).toFixed(2)+' GB'; }
+  };
+  xhr.onload = () => {
+    let d = {}; try { d = JSON.parse(xhr.responseText); } catch(e){}
+    if (xhr.status >= 200 && xhr.status < 300 && d.key){
+      fill.style.width = '100%'; pct.textContent = '100%';
+      text.textContent = 'uploaded ✓ — Save & restart to use it';
+      const sel = document.getElementById(selectId);
+      if (!Array.prototype.some.call(sel.options, o => o.value === d.key)){
+        const o = document.createElement('option');
+        o.value = d.key; o.textContent = 'Custom: ' + d.name; sel.appendChild(o);
+      }
+      sel.value = d.key; inp.value = '';
+      if (onDone) onDone();
+    } else { text.textContent = 'upload failed: ' + (d.error || ('HTTP '+xhr.status)); }
+  };
+  xhr.onerror = () => { text.textContent = 'upload failed (network error).'; };
+  xhr.send(fd);
+}
+updateImgVram();
+refreshImageStatus();
+
+// --- Video connection (model status + VRAM hint) ---
+const VIDEO_META = {{ video_meta|tojson }};
+let vidPollTimer = null;
+function curVideoModel(){ const el = document.getElementById('videoModel'); return el ? el.value : 'none'; }
+function updateVidVram(){
+  const box = document.getElementById('vidVram');
+  if (!box) return;
+  const meta = VIDEO_META[curVideoModel()];
+  if (!meta || meta.vram == null){ box.textContent = '—'; return; }
+  let txt = '~'+meta.vram+' GB'+(meta.size ? (' · '+meta.size+'px') : '');
+  if (GPU_TOTAL_GB != null) txt += ' of '+GPU_TOTAL_GB+' GB'
+    + (meta.vram > GPU_TOTAL_GB ? ' — too big for GPU' : '');
+  box.textContent = txt;
+}
+function onVideoModelChange(){ updateVidVram(); refreshVideoStatus(); }
+async function refreshVideoStatus(){
+  const pill = document.getElementById('vidPill');
+  const note = document.getElementById('vidSetupNote');
+  const dlBtn = document.getElementById('vidDlBtn');
+  const prog = document.getElementById('vidDlProgress');
+  if (!pill) return;
+  let d;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const resp = await fetch('/video/status.json?model='+encodeURIComponent(curVideoModel()),
+                             {cache:'no-store', signal: ctl.signal});
+    clearTimeout(t);
+    d = await resp.json();
+  } catch(e){
+    pill.className = 'pill off'; pill.textContent = 'status unavailable — retrying…';
+    clearTimeout(vidPollTimer); vidPollTimer = setTimeout(refreshVideoStatus, 3000); return;
+  }
+  clearTimeout(vidPollTimer);
+  pill.style.background = ''; pill.style.color = '';
+  dlBtn.style.display = 'none'; prog.style.display = 'none';
+  if (note) note.style.display = 'none';
+
+  if (!d.enabled){ pill.className = 'pill off'; pill.textContent = 'video generation off'; return; }
+  if (d.downloading){
+    pill.className = 'pill'; pill.style.background = 'var(--warn-bg)'; pill.style.color = 'var(--warn-text)';
+    pill.textContent = '⬇ downloading weights…';
+    prog.style.display = '';
+    const fill = document.getElementById('vidDlFill');
+    if (d.pct != null){ fill.style.opacity = '1'; fill.style.width = d.pct + '%';
+                        document.getElementById('vidDlPct').textContent = d.pct + '%'; }
+    else { fill.style.opacity = '.4'; fill.style.width = '100%'; document.getElementById('vidDlPct').textContent = ''; }
+    document.getElementById('vidDlText').textContent =
+      (d.downloaded_gb != null ? d.downloaded_gb + ' GB' : '') + (d.dl_gb ? (' / ~' + d.dl_gb + ' GB') : '');
+    vidPollTimer = setTimeout(refreshVideoStatus, 1500);
+    return;
+  }
+  if (!d.downloaded && !d.custom){
+    pill.className = 'pill off';
+    pill.textContent = 'not downloaded' + (d.dl_gb ? (' · ~' + d.dl_gb + ' GB') : '');
+    dlBtn.style.display = '';
+    if (note && !d.installed) note.style.display = '';
+    return;
+  }
+  if (!d.installed){ pill.className = 'pill on'; pill.textContent = 'downloaded · venv not installed';
+                     if (note) note.style.display = ''; return; }
+  if (d.error){ pill.className = 'pill off'; pill.style.background='var(--bad-bg)'; pill.style.color='var(--bad-text)';
+                pill.textContent = 'load failed — see logs'; return; }
+  if (d.ready){ pill.className = 'pill on'; pill.textContent = 'model loaded ('+(d.device||'')+')'; return; }
+  if (d.loading){ pill.className = 'pill'; pill.style.background='var(--warn-bg)'; pill.style.color='var(--warn-text)';
+                  pill.textContent = 'loading model…'; vidPollTimer = setTimeout(refreshVideoStatus, 2000); return; }
+  pill.className = 'pill on'; pill.textContent = (d.custom ? 'uploaded' : 'downloaded') + ' · ready (loads on first video)';
+}
+async function downloadVideoModel(){
+  const key = curVideoModel();
+  if (key === 'none'){ alert('Select a video model first.'); return; }
+  const fd = new FormData(); fd.append('video_model', key);
+  const pill = document.getElementById('vidPill');
+  pill.className = 'pill'; pill.textContent = 'starting…';
+  try { const r = await fetch('/video/download', {method:'POST', body: fd});
+        const j = await r.json().catch(()=>({}));
+        if (j.error){ alert('Download failed: ' + j.error); } }
+  catch(e){ alert('Download failed: ' + e); }
+  setTimeout(refreshVideoStatus, 700);
+}
+updateVidVram();
+refreshVideoStatus();
+
+// Make each settings section collapsible (collapsed by default). A section whose
+// only control is a single switch keeps that switch in the header, so it stays
+// usable while collapsed.
+(function(){
+  document.querySelectorAll('.card').forEach(function(card){
+    var h2 = card.querySelector(':scope > h2');
+    if(!h2) return;
+    var body = document.createElement('div');
+    body.className = 'card-body';
+    while(h2.nextSibling){ body.appendChild(h2.nextSibling); }
+    card.appendChild(body);
+
+    var controls = body.querySelectorAll('input, select, textarea, button');
+    var lone = (controls.length === 1 && controls[0].type === 'checkbox') ? controls[0] : null;
+
+    h2.classList.add('card-h2');
+    var caret = document.createElement('span');
+    caret.className = 'card-caret';
+    caret.textContent = '▸';            // ▸
+    h2.insertBefore(caret, h2.firstChild);
+
+    if(lone){                                 // surface the single switch in the header
+      var holder = document.createElement('span');
+      holder.className = 'hdr-switch';
+      holder.appendChild(lone.closest('label') || lone);
+      h2.appendChild(holder);
+      holder.addEventListener('click', function(e){ e.stopPropagation(); });
+    }
+
+    card.classList.add('collapsed');
+    h2.addEventListener('click', function(){ card.classList.toggle('collapsed'); });
+  });
+})();
 </script>
 </body></html>"""
 
 
 CHAT_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Conversation — Voice Assistant</title>
+<html lang="en" data-theme="midnight"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conversation — Voice Assistant</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cleo_theme')||'midnight'}catch(e){}</script>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 0 auto;
-         padding: 0 1rem 6rem; background:#15171c; color:#e6e6e6; }
-  header { position:sticky; top:0; background:#15171c; padding:1rem 0 .6rem;
-           border-bottom:1px solid #2c313c; display:flex; align-items:center; gap:1rem; }
-  h1 { font-size:1.2rem; margin:0; flex:1; }
-  .dot { width:.6rem; height:.6rem; border-radius:50%; background:#555; display:inline-block; }
-  .dot.live { background:#7ee2a8; }
-  button { background:#333a47; color:#fff; border:0; border-radius:6px; padding:.45rem .8rem;
-           font-size:.85rem; cursor:pointer; } button:hover { filter:brightness(1.2); }
-  .turn { display:flex; margin:.6rem 0; }
-  .turn.user { justify-content:flex-end; }
-  .bubble { max-width:78%; padding:.55rem .85rem; border-radius:14px; line-height:1.35;
-            white-space:pre-wrap; word-wrap:break-word; }
-  .user .bubble { background:#2d6cdf; color:#fff; border-bottom-right-radius:4px; }
-  .assistant .bubble { background:#1d2027; border:1px solid #2c313c; border-bottom-left-radius:4px; }
-  .time { font-size:.66rem; color:#778; margin:.15rem .3rem 0; }
-  .meta { font-size:.66rem; color:#8a93a6; margin:.15rem .3rem 0;
-          display:flex; gap:.7rem; flex-wrap:wrap; }
-  .meta b { color:#9ecbff; font-weight:600; }
-  .empty { color:#778; text-align:center; margin-top:3rem; }
-  .cursor { display:inline-block; width:.5ch; animation:blink 1s steps(1) infinite; color:#9ecbff; }
-  @keyframes blink { 50% { opacity:0; } }
-  .pulse .bubble { border-color:#3b7cf0; }
-  .phase { font-style:italic; color:#8a93a6; }
-  .summary { margin:1.4rem 0 .4rem; padding:.7rem .9rem; background:#1a1d24;
-             border:1px solid #2c313c; border-radius:10px; font-size:.78rem; color:#aeb6c4; }
-  .summary h2 { font-size:.8rem; margin:0 0 .4rem; color:#9ecbff; }
-  .summary .grid { display:flex; gap:1.4rem; flex-wrap:wrap; }
-  .summary b { color:#e6e6e6; font-size:1rem; display:block; }
-  #composer { position:fixed; left:0; right:0; bottom:0; background:#15171c;
-              border-top:1px solid #2c313c; padding:.6rem 1rem; }
-  #composer .inner { max-width:760px; margin:0 auto; display:flex; gap:.5rem; }
-  #msg { flex:1; background:#11131a; color:#e6e6e6; border:1px solid #333a47;
-         border-radius:8px; padding:.6rem .75rem; font-size:.92rem; }
-  #msg:focus { outline:none; border-color:#3b7cf0; }
-  #sendbtn { background:#2d6cdf; padding:.55rem 1.1rem; }
-  #sendbtn:hover { background:#3b7cf0; filter:none; }
-  #sendbtn:disabled { opacity:.5; cursor:default; }
+  *{ box-sizing:border-box; }
+  :root{ color-scheme:dark;
+    --bg:#0f1117; --card:#1a1e27; --card-border:#262c3a; --card-hover:#39435c;
+    --input-bg:#11141c; --input-border:#2e3545; --text:#e8eaf0; --dim:#9aa3b5; --faint:#6b7385;
+    --accent:#4d7cff; --accent2:#6b5cff; --accent-text:#fff; --ok-text:#5fdd8f; --shadow:rgba(0,0,0,.35); }
+  [data-theme="nord"]{ color-scheme:dark; --bg:#262b35; --card:#3b4252; --card-border:#434c5e; --card-hover:#4c566a;
+    --input-bg:#2e3440; --input-border:#434c5e; --text:#eceff4; --dim:#d8dee9; --faint:#8b95a7;
+    --accent:#88c0d0; --accent2:#81a1c1; --accent-text:#2e3440; --ok-text:#a3be8c; --shadow:rgba(0,0,0,.3); }
+  [data-theme="dracula"]{ color-scheme:dark; --bg:#1b1c25; --card:#282a36; --card-border:#383a4a; --card-hover:#6272a4;
+    --input-bg:#1e1f29; --input-border:#44475a; --text:#f8f8f2; --dim:#bcc0d6; --faint:#6272a4;
+    --accent:#bd93f9; --accent2:#ff79c6; --accent-text:#21222c; --ok-text:#50fa7b; --shadow:rgba(0,0,0,.4); }
+  [data-theme="emerald"]{ color-scheme:dark; --bg:#0c1310; --card:#14211b; --card-border:#21342a; --card-hover:#2f5742;
+    --input-bg:#0e1713; --input-border:#243a2e; --text:#e6f0ea; --dim:#9bb3a6; --faint:#6a8579;
+    --accent:#2dd4a7; --accent2:#14b8a6; --accent-text:#04241c; --ok-text:#5fdd8f; --shadow:rgba(0,0,0,.35); }
+  [data-theme="synthwave"]{ color-scheme:dark; --bg:#181029; --card:#241a3a; --card-border:#3d2c5e; --card-hover:#6d4bb0;
+    --input-bg:#1c1230; --input-border:#3d2c5e; --text:#f5e6ff; --dim:#c4a8e0; --faint:#8a72b0;
+    --accent:#ff2e97; --accent2:#7b5cff; --accent-text:#fff; --ok-text:#3affc8; --shadow:rgba(255,46,151,.18); }
+  [data-theme="light"]{ color-scheme:light; --bg:#eef1f6; --card:#ffffff; --card-border:#dde3ec; --card-hover:#b9c4d6;
+    --input-bg:#f6f8fc; --input-border:#d2dae6; --text:#1c2430; --dim:#5a6678; --faint:#8a95a6;
+    --accent:#3b6fe0; --accent2:#6b5cff; --accent-text:#fff; --ok-text:#1d7a45; --shadow:rgba(20,30,50,.12); }
+
+  body{ font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; max-width:820px; margin:0 auto;
+        padding:0 1rem 6rem; background:var(--bg); color:var(--text); line-height:1.45; -webkit-font-smoothing:antialiased; }
+  body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:radial-gradient(1100px 600px at 50% -240px, color-mix(in srgb,var(--accent) 16%,transparent), transparent 70%); }
+  header{ position:sticky; top:0; z-index:20; background:color-mix(in srgb,var(--bg) 82%,transparent);
+    backdrop-filter:blur(12px); padding:.9rem 0 .7rem; border-bottom:1px solid var(--card-border);
+    display:flex; align-items:center; gap:1rem; }
+  h1{ font-size:1.2rem; margin:0; }
+  .swatchbar{ display:flex; gap:.45rem; align-items:center; flex:1; }
+  .swatch{ width:20px; height:20px; min-width:0; padding:0; border-radius:50%; cursor:pointer; background:var(--sw,#888);
+    border:2px solid transparent; box-shadow:0 1px 4px var(--shadow); transition:transform .12s ease, border-color .12s; }
+  .swatch:hover{ transform:scale(1.18); filter:none; }
+  .swatch.active{ border-color:var(--text); transform:scale(1.1); }
+  .dot{ width:.6rem; height:.6rem; border-radius:50%; background:var(--faint); display:inline-block; transition:background .3s, box-shadow .3s; }
+  .dot.live{ background:var(--ok-text); box-shadow:0 0 8px var(--ok-text); }
+  button{ background:var(--input-bg); color:var(--text); border:1px solid var(--input-border); border-radius:8px;
+    padding:.45rem .85rem; font-size:.85rem; cursor:pointer; font-weight:600; font-family:inherit;
+    transition:border-color .15s, background .15s, filter .15s; }
+  button:hover{ border-color:var(--accent); background:var(--card); }
+  .turn{ display:flex; margin:.6rem 0; }
+  .turn.user{ justify-content:flex-end; }
+  .bubble{ max-width:78%; padding:.6rem .9rem; border-radius:16px; line-height:1.4;
+           white-space:pre-wrap; word-wrap:break-word; box-shadow:0 1px 6px var(--shadow); }
+  .user .bubble{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--accent-text); border-bottom-right-radius:5px; }
+  .assistant .bubble{ background:var(--card); border:1px solid var(--card-border); border-bottom-left-radius:5px; }
+  .genimg{ display:block; max-width:min(78%,420px); margin:.35rem 0; border-radius:14px;
+           border:1px solid var(--card-border); box-shadow:0 1px 6px var(--shadow); cursor:pointer; }
+  .time{ font-size:.66rem; color:var(--faint); margin:.15rem .35rem 0; }
+  .meta{ font-size:.66rem; color:var(--dim); margin:.2rem .35rem 0; display:flex; gap:.7rem; flex-wrap:wrap; }
+  .meta b{ color:var(--accent); font-weight:600; }
+  .empty{ color:var(--faint); text-align:center; margin-top:3.5rem; }
+  .cursor{ display:inline-block; width:.5ch; animation:blink 1s steps(1) infinite; color:var(--accent); }
+  @keyframes blink{ 50%{ opacity:0; } }
+  .pulse .bubble{ border-color:var(--accent); box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 40%,transparent); }
+  .phase{ font-style:italic; color:var(--dim); }
+  .summary{ margin:1.5rem 0 .4rem; padding:.8rem 1rem; background:var(--card); border:1px solid var(--card-border);
+    border-radius:12px; font-size:.78rem; color:var(--dim); }
+  .summary h2{ font-size:.8rem; margin:0 0 .5rem; color:var(--accent); }
+  .summary .grid{ display:flex; gap:1.6rem; flex-wrap:wrap; }
+  .summary b{ color:var(--text); font-size:1.05rem; display:block; }
+  #composer{ position:fixed; left:0; right:0; bottom:0; z-index:20; background:color-mix(in srgb,var(--bg) 88%,transparent);
+    backdrop-filter:blur(12px); border-top:1px solid var(--card-border); padding:.7rem 1rem; }
+  #composer .inner{ max-width:820px; margin:0 auto; display:flex; gap:.5rem; }
+  #msg{ flex:1; background:var(--input-bg); color:var(--text); border:1px solid var(--input-border); border-radius:10px;
+    padding:.65rem .8rem; font-size:.92rem; font-family:inherit; }
+  #msg:focus{ outline:none; border-color:var(--accent); box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent); }
+  #sendbtn{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--accent-text); border:0;
+    padding:.6rem 1.2rem; font-weight:600; }
+  #sendbtn:hover{ filter:brightness(1.08); border:0; }
+  #sendbtn:disabled{ opacity:.5; cursor:default; }
+  ::-webkit-scrollbar{ width:11px; }
+  ::-webkit-scrollbar-thumb{ background:var(--card-border); border-radius:999px; border:3px solid var(--bg); }
 </style></head><body>
 <header>
   <h1>💬 Conversation</h1>
-  <span class="dot" id="live"></span>
+  <div class="swatchbar" id="themeBar"></div>
+  <span class="dot" id="live" title="live status"></span>
   <button onclick="clearChat()">Clear</button>
 </header>
 <div id="log"><p class="empty">No conversation yet. Say the wake word or type a message below to start.</p></div>
@@ -1101,9 +2699,27 @@ function metaHtml(m){
   if (!parts.length) return '';
   return '<div class="meta">'+parts.join('')+'</div>';
 }
+// Pull [[IMAGE:name]] markers out of a turn's text, returning the remaining
+// prose and the <img> tags for any generated images.
+function splitImages(text){
+  const imgs = [];
+  let body = (text||'').replace(/\\[\\[IMAGE:([^\\]]+)\\]\\]/g, (m, n) => {
+    imgs.push('<img class="genimg" src="/chat/image/'+encodeURIComponent(n.trim())
+            + '" loading="lazy" onclick="window.open(this.src)">');
+    return '';
+  });
+  body = body.replace(/\\[\\[VIDEO:([^\\]]+)\\]\\]/g, (m, n) => {
+    imgs.push('<video class="genimg" src="/chat/video/'+encodeURIComponent(n.trim())
+            + '" controls preload="metadata"></video>');
+    return '';
+  });
+  return { body: body.trim(), imgs: imgs.join('') };
+}
 function turnHtml(role, text, ts, meta){
   const who = role === 'user' ? 'user' : 'assistant';
-  return '<div class="turn '+who+'"><div><div class="bubble">'+esc(text)+'</div>'
+  const { body, imgs } = splitImages(text);
+  const bubble = body ? '<div class="bubble">'+esc(body)+'</div>' : '';
+  return '<div class="turn '+who+'"><div>'+bubble+imgs
        + (ts ? '<div class="time" style="text-align:'+(who==='user'?'right':'left')+'">'+fmt(ts)+'</div>' : '')
        + (who==='assistant' ? metaHtml(meta) : '') + '</div></div>';
 }
@@ -1188,7 +2804,263 @@ async function send(){
     inp.focus(); kick();
   }
 }
+// --- Themes ---
+const THEMES = [['midnight','Midnight','#4d7cff'],['nord','Nord','#88c0d0'],
+  ['dracula','Dracula','#bd93f9'],['emerald','Emerald','#2dd4a7'],
+  ['synthwave','Synthwave','#ff2e97'],['light','Light','#3b6fe0']];
+function applyTheme(t){
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('cleo_theme', t); } catch(e){}
+  document.querySelectorAll('.swatch').forEach(s => s.classList.toggle('active', s.dataset.t === t));
+}
+(function initThemes(){
+  const bar = document.getElementById('themeBar');
+  if (bar) bar.innerHTML = THEMES.map(([id,n,c]) =>
+    '<button type="button" class="swatch" data-t="'+id+'" title="'+n+'" style="--sw:'+c
+    +'" onclick="applyTheme(\\''+id+'\\')"></button>').join('');
+  let s = 'midnight';
+  try { s = localStorage.getItem('cleo_theme') || 'midnight'; } catch(e){}
+  applyTheme(s);
+})();
 poll();
+</script>
+</body></html>"""
+
+
+IMAGE_PAGE = """<!doctype html>
+<html lang="en" data-theme="midnight"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image generation — Voice Assistant</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cleo_theme')||'midnight'}catch(e){}</script>
+<style>
+  *{ box-sizing:border-box; }
+  :root{ color-scheme:dark;
+    --bg:#0f1117; --card:#1a1e27; --card-border:#262c3a; --input-bg:#11141c; --input-border:#2e3545;
+    --text:#e8eaf0; --dim:#9aa3b5; --faint:#6b7385; --accent:#4d7cff; --accent2:#6b5cff;
+    --accent-text:#fff; --ok-text:#5fdd8f; --bad-text:#ff7a7a; --shadow:rgba(0,0,0,.35); }
+  body{ font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; max-width:820px; margin:0 auto;
+        padding:0 1rem 5rem; background:var(--bg); color:var(--text); line-height:1.45; }
+  body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:radial-gradient(1100px 600px at 50% -240px, color-mix(in srgb,var(--accent) 16%,transparent), transparent 70%); }
+  header{ position:sticky; top:0; z-index:20; background:color-mix(in srgb,var(--bg) 82%,transparent);
+    backdrop-filter:blur(12px); padding:.9rem 0 .7rem; border-bottom:1px solid var(--card-border);
+    display:flex; align-items:center; gap:1rem; }
+  h1{ font-size:1.2rem; margin:0; flex:1; }
+  a{ color:var(--accent); }
+  textarea{ width:100%; background:var(--input-bg); color:var(--text); border:1px solid var(--input-border);
+    border-radius:10px; padding:.7rem .9rem; font-family:inherit; font-size:.95rem; resize:vertical; min-height:4.2rem; }
+  .row{ display:flex; gap:.7rem; align-items:center; margin-top:.6rem; flex-wrap:wrap; }
+  button{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--accent-text); border:0;
+    border-radius:9px; padding:.6rem 1.1rem; font-size:.92rem; cursor:pointer; font-weight:700; font-family:inherit; }
+  button:disabled{ filter:grayscale(.5) brightness(.7); cursor:default; }
+  input[type=number]{ width:5.5rem; background:var(--input-bg); color:var(--text);
+    border:1px solid var(--input-border); border-radius:8px; padding:.45rem .5rem; font-family:inherit; }
+  select{ background:var(--input-bg); color:var(--text); border:1px solid var(--input-border);
+    border-radius:8px; padding:.45rem .5rem; font-family:inherit; }
+  .pill{ font-size:.72rem; padding:.18rem .55rem; border-radius:999px; border:1px solid var(--card-border);
+    background:var(--input-bg); color:var(--dim); }
+  .pill.on{ color:var(--ok-text); border-color:color-mix(in srgb,var(--ok-text) 45%,transparent); }
+  .pill.bad{ color:var(--bad-text); border-color:color-mix(in srgb,var(--bad-text) 45%,transparent); }
+  .hint{ color:var(--faint); font-size:.8rem; }
+  .gallery{ margin-top:1.3rem; display:flex; flex-direction:column; gap:1.1rem; }
+  .shot{ background:var(--card); border:1px solid var(--card-border); border-radius:14px; padding:.7rem;
+    box-shadow:0 1px 8px var(--shadow); }
+  .shot img{ width:100%; border-radius:10px; display:block; }
+  .shot .cap{ color:var(--dim); font-size:.82rem; margin-top:.5rem; }
+  .empty{ color:var(--faint); text-align:center; margin-top:2.5rem; }
+</style></head>
+<body>
+<header>
+  <h1>🎨 Image generation</h1>
+  <span id="statePill" class="pill">checking…</span>
+  <a href="/">← panel</a>
+</header>
+
+<textarea id="prompt" placeholder="Describe an image to generate — e.g. 'a watercolor fox in a snowy forest at dusk'"></textarea>
+<div class="row">
+  <button id="gen" onclick="generate()">Generate</button>
+  <label class="hint">W <input type="number" id="width" min="0" max="2048" step="64" value="0" title="0 = model default. Use multiples of 64."></label>
+  <label class="hint">H <input type="number" id="height" min="0" max="2048" step="64" value="0" title="0 = model default. Use multiples of 64."></label>
+  <label class="hint">steps <input type="number" id="steps" min="0" max="50" value="0" title="0 = model default"></label>
+  <label class="hint">CFG <input type="number" id="cfg" min="0" max="30" step="0.5" value="0" title="0 = model default. Turbo models ignore CFG."></label>
+  <label class="hint">sampler
+    <select id="sampler" title="Scheduler / sampling algorithm">
+      <option value="default">default</option>
+      <option value="euler">Euler</option>
+      <option value="euler_a">Euler a</option>
+      <option value="dpmpp_2m">DPM++ 2M</option>
+      <option value="dpmpp_2m_karras">DPM++ 2M Karras</option>
+      <option value="dpmpp_sde">DPM++ SDE</option>
+      <option value="unipc">UniPC</option>
+      <option value="ddim">DDIM</option>
+      <option value="lms">LMS</option>
+      <option value="heun">Heun</option>
+    </select>
+  </label>
+  <span id="msg" class="hint"></span>
+</div>
+
+<div id="gallery" class="gallery"><p class="empty" id="empty">Generated images will appear here.</p></div>
+
+<script>
+const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+let busy = false;
+async function refreshState(){
+  const pill = document.getElementById('statePill');
+  let d;
+  try { d = await (await fetch('/image/status.json', {cache:'no-store'})).json(); }
+  catch(e){ pill.className='pill bad'; pill.textContent='panel unreachable'; return; }
+  if (!d.enabled){ pill.className='pill bad'; pill.textContent='no image model selected'; }
+  else if (!d.installed){ pill.className='pill bad'; pill.textContent='image venv not installed'; }
+  else if (d.error){ pill.className='pill bad'; pill.textContent='load failed'; }
+  else if (d.ready){ pill.className='pill on'; pill.textContent='model loaded'; }
+  else if (d.loading){ pill.className='pill'; pill.textContent='loading model…'; setTimeout(refreshState, 2000); }
+  else { pill.className='pill'; pill.textContent='ready'; }
+}
+async function generate(){
+  if (busy) return;
+  const prompt = document.getElementById('prompt').value.trim();
+  const msg = document.getElementById('msg'), btn = document.getElementById('gen');
+  if (!prompt){ msg.textContent = 'Enter a prompt first.'; return; }
+  const steps = parseInt(document.getElementById('steps').value) || 0;
+  const cfg = parseFloat(document.getElementById('cfg').value) || 0;
+  const sampler = document.getElementById('sampler').value;
+  const width = parseInt(document.getElementById('width').value) || 0;
+  const height = parseInt(document.getElementById('height').value) || 0;
+  busy = true; btn.disabled = true; btn.textContent = 'Generating…';
+  msg.textContent = 'Working… (first run loads/downloads the model — can take a while)';
+  try {
+    const r = await fetch('/image/generate', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({prompt, steps, cfg, sampler, width, height})});
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok || d.error){ msg.textContent = d.error || 'Generation failed.'; }
+    else {
+      msg.textContent = '';
+      const e = document.getElementById('empty'); if (e) e.remove();
+      const g = document.getElementById('gallery');
+      const div = document.createElement('div');
+      div.className = 'shot';
+      div.innerHTML = '<img src="'+d.url+'" loading="lazy" onclick="window.open(this.src)">'
+                    + '<div class="cap">'+esc(d.prompt)+'</div>';
+      g.insertBefore(div, g.firstChild);
+    }
+  } catch(e){ msg.textContent = 'Generation failed: ' + e; }
+  finally { busy = false; btn.disabled = false; btn.textContent = 'Generate'; refreshState(); }
+}
+document.getElementById('prompt').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) generate();
+});
+refreshState();
+</script>
+</body></html>"""
+
+
+VIDEO_PAGE = """<!doctype html>
+<html lang="en" data-theme="midnight"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video generation — Voice Assistant</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('cleo_theme')||'midnight'}catch(e){}</script>
+<style>
+  *{ box-sizing:border-box; }
+  :root{ color-scheme:dark;
+    --bg:#0f1117; --card:#1a1e27; --card-border:#262c3a; --input-bg:#11141c; --input-border:#2e3545;
+    --text:#e8eaf0; --dim:#9aa3b5; --faint:#6b7385; --accent:#4d7cff; --accent2:#6b5cff;
+    --accent-text:#fff; --ok-text:#5fdd8f; --bad-text:#ff7a7a; --shadow:rgba(0,0,0,.35); }
+  body{ font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; max-width:820px; margin:0 auto;
+        padding:0 1rem 5rem; background:var(--bg); color:var(--text); line-height:1.45; }
+  body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:radial-gradient(1100px 600px at 50% -240px, color-mix(in srgb,var(--accent) 16%,transparent), transparent 70%); }
+  header{ position:sticky; top:0; z-index:20; background:color-mix(in srgb,var(--bg) 82%,transparent);
+    backdrop-filter:blur(12px); padding:.9rem 0 .7rem; border-bottom:1px solid var(--card-border);
+    display:flex; align-items:center; gap:1rem; }
+  h1{ font-size:1.2rem; margin:0; flex:1; }
+  a{ color:var(--accent); }
+  textarea{ width:100%; background:var(--input-bg); color:var(--text); border:1px solid var(--input-border);
+    border-radius:10px; padding:.7rem .9rem; font-family:inherit; font-size:.95rem; resize:vertical; min-height:4.2rem; }
+  .row{ display:flex; gap:.7rem; align-items:center; margin-top:.6rem; flex-wrap:wrap; }
+  button{ background:linear-gradient(135deg,var(--accent),var(--accent2)); color:var(--accent-text); border:0;
+    border-radius:9px; padding:.6rem 1.1rem; font-size:.92rem; cursor:pointer; font-weight:700; font-family:inherit; }
+  button:disabled{ filter:grayscale(.5) brightness(.7); cursor:default; }
+  input[type=number]{ width:5.5rem; background:var(--input-bg); color:var(--text);
+    border:1px solid var(--input-border); border-radius:8px; padding:.45rem .5rem; font-family:inherit; }
+  .pill{ font-size:.72rem; padding:.18rem .55rem; border-radius:999px; border:1px solid var(--card-border);
+    background:var(--input-bg); color:var(--dim); }
+  .pill.on{ color:var(--ok-text); border-color:color-mix(in srgb,var(--ok-text) 45%,transparent); }
+  .pill.bad{ color:var(--bad-text); border-color:color-mix(in srgb,var(--bad-text) 45%,transparent); }
+  .hint{ color:var(--faint); font-size:.8rem; }
+  .gallery{ margin-top:1.3rem; display:flex; flex-direction:column; gap:1.1rem; }
+  .shot{ background:var(--card); border:1px solid var(--card-border); border-radius:14px; padding:.7rem;
+    box-shadow:0 1px 8px var(--shadow); }
+  .shot video{ width:100%; border-radius:10px; display:block; background:#000; }
+  .shot .cap{ color:var(--dim); font-size:.82rem; margin-top:.5rem; }
+  .empty{ color:var(--faint); text-align:center; margin-top:2.5rem; }
+</style></head>
+<body>
+<header>
+  <h1>🎬 Video generation</h1>
+  <span id="statePill" class="pill">checking…</span>
+  <a href="/">← panel</a>
+</header>
+
+<textarea id="prompt" placeholder="Describe a video to generate — e.g. 'a fox running through a snowy forest, cinematic, slow motion'"></textarea>
+<div class="row">
+  <button id="gen" onclick="generate()">Generate</button>
+  <label class="hint">frames <input type="number" id="frames" min="0" max="257" value="0" title="0 = model default"></label>
+  <label class="hint">steps <input type="number" id="steps" min="0" max="100" value="0" title="0 = model default"></label>
+  <span id="msg" class="hint"></span>
+</div>
+<p class="hint">Heads-up: video generation is slow — often a minute or more per clip, and the first run
+   loads/downloads the model.</p>
+
+<div id="gallery" class="gallery"><p class="empty" id="empty">Generated videos will appear here.</p></div>
+
+<script>
+const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+let busy = false;
+async function refreshState(){
+  const pill = document.getElementById('statePill');
+  let d;
+  try { d = await (await fetch('/video/status.json', {cache:'no-store'})).json(); }
+  catch(e){ pill.className='pill bad'; pill.textContent='panel unreachable'; return; }
+  if (!d.enabled){ pill.className='pill bad'; pill.textContent='no video model selected'; }
+  else if (!d.installed){ pill.className='pill bad'; pill.textContent='video venv not installed'; }
+  else if (d.error){ pill.className='pill bad'; pill.textContent='load failed'; }
+  else if (d.ready){ pill.className='pill on'; pill.textContent='model loaded'; }
+  else if (d.loading){ pill.className='pill'; pill.textContent='loading model…'; setTimeout(refreshState, 2000); }
+  else if (d.downloading){ pill.className='pill'; pill.textContent='downloading weights…'; setTimeout(refreshState, 2500); }
+  else { pill.className='pill'; pill.textContent='ready'; }
+}
+async function generate(){
+  if (busy) return;
+  const prompt = document.getElementById('prompt').value.trim();
+  const msg = document.getElementById('msg'), btn = document.getElementById('gen');
+  if (!prompt){ msg.textContent = 'Enter a prompt first.'; return; }
+  const frames = parseInt(document.getElementById('frames').value) || 0;
+  const steps = parseInt(document.getElementById('steps').value) || 0;
+  busy = true; btn.disabled = true; btn.textContent = 'Generating…';
+  msg.textContent = 'Working… video can take a while (first run loads/downloads the model).';
+  try {
+    const r = await fetch('/video/generate', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({prompt, frames, steps})});
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok || d.error){ msg.textContent = d.error || 'Generation failed.'; }
+    else {
+      msg.textContent = '';
+      const e = document.getElementById('empty'); if (e) e.remove();
+      const g = document.getElementById('gallery');
+      const div = document.createElement('div');
+      div.className = 'shot';
+      div.innerHTML = '<video src="'+d.url+'" controls autoplay loop muted playsinline></video>'
+                    + '<div class="cap">'+esc(d.prompt)+'</div>';
+      g.insertBefore(div, g.firstChild);
+    }
+  } catch(e){ msg.textContent = 'Generation failed: ' + e; }
+  finally { busy = false; btn.disabled = false; btn.textContent = 'Generate'; refreshState(); }
+}
+document.getElementById('prompt').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) generate();
+});
+refreshState();
 </script>
 </body></html>"""
 

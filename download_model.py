@@ -3,7 +3,10 @@
 Download a single model's GGUF (and mmproj, if any) from its HuggingFace repo
 into the model's local dir. Driven by the LLM_MODELS registry in config.py.
 
-    python3 download_model.py <model_key>
+    python3 download_model.py <model_key> [quant_name]
+
+With a model that has quant variants, pass the quant name (e.g. Q8_0) to fetch
+that one; omit it to use the model's selected/default quant.
 
 Launched detached by the control panel's "Download" button; progress is written
 to logs/model_download.log. Safe to re-run — hf_hub_download resumes/skips.
@@ -18,8 +21,8 @@ import config
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in config.LLM_MODELS:
-        print(f"usage: download_model.py <{ '|'.join(config.LLM_MODELS) }>")
+    if len(sys.argv) not in (2, 3) or sys.argv[1] not in config.LLM_MODELS:
+        print(f"usage: download_model.py <{ '|'.join(config.LLM_MODELS) }> [quant]")
         return 2
 
     key = sys.argv[1]
@@ -30,12 +33,27 @@ def main() -> int:
         print(f"No hf_repo configured for '{key}' — nothing to download.")
         return 2
 
+    # Which GGUF: an explicit quant arg, else the model's selected/default quant,
+    # else the model's single gguf.
+    gguf = m["gguf"]
+    quants = config.model_quants(key)
+    if len(sys.argv) == 3 and quants:
+        want = sys.argv[2]
+        match = next((q for q in quants if q["name"] == want), None)
+        if not match:
+            print(f"Unknown quant '{want}' for {key}; have: "
+                  f"{', '.join(q['name'] for q in quants)}")
+            return 2
+        gguf = match["gguf"]
+    elif quants:
+        gguf = config.gguf_for(key)
+
     os.makedirs(dest, exist_ok=True)
     sentinel = os.path.join(dest, ".downloading")
     open(sentinel, "w").close()
     try:
         from huggingface_hub import hf_hub_download
-        files = [m["gguf"]] + ([m["mmproj"]] if m.get("mmproj") else [])
+        files = [gguf] + ([m["mmproj"]] if m.get("mmproj") else [])
         for fn in files:
             target = os.path.join(dest, fn)
             if os.path.exists(target):

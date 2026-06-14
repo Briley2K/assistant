@@ -36,8 +36,15 @@ def warmup() -> None:
     elif config.TTS_ENGINE == "neutts":
         from modules import neutts_tts
         neutts_tts.warmup()
+    elif config.TTS_ENGINE == "chatterbox":
+        from modules import chatterbox_tts
+        chatterbox_tts.warmup()
     else:
         _get_voice()
+
+
+_neutts_warned = False
+_cb_warned = False
 
 
 def _synth_wav(cleaned: str) -> bytes:
@@ -45,9 +52,37 @@ def _synth_wav(cleaned: str) -> bytes:
     if config.TTS_ENGINE == "kokoro":
         from modules import kokoro_tts
         return kokoro_tts.synth_wav(cleaned)
+    if config.TTS_ENGINE == "chatterbox":
+        # Runs in the chatterbox GPU venv/helper; if it's missing or fails, fall
+        # back to Kokoro so the assistant still speaks (the helper logs the real
+        # error to logs/chatterbox_helper.log).
+        try:
+            from modules import chatterbox_tts
+            return chatterbox_tts.synth_wav(cleaned)
+        except Exception as e:
+            global _cb_warned
+            if not _cb_warned:
+                print(f"[TTS] Chatterbox synth failed ({e}) — using Kokoro. "
+                      "Check logs/chatterbox_helper.log.")
+                _cb_warned = True
+            from modules import kokoro_tts
+            return kokoro_tts.synth_wav(cleaned)
     if config.TTS_ENGINE == "neutts":
-        from modules import neutts_tts
-        return neutts_tts.synth_wav(cleaned)
+        # NeuTTS runs in a separate venv/helper that can be missing or fail to
+        # load (bad reference clip, model not downloaded, …). Rather than going
+        # silent, fall back to Kokoro so the assistant still speaks.
+        try:
+            from modules import neutts_tts
+            return neutts_tts.synth_wav(cleaned)
+        except Exception as e:
+            global _neutts_warned
+            if not _neutts_warned:
+                print(f"[TTS] NeuTTS synth failed ({e}) — speaking with Kokoro instead. "
+                      "Common cause: reference clip too long/odd; check the NeuTTS helper "
+                      "output (neutts_test/neutts_server.py runs with stderr hidden).")
+                _neutts_warned = True
+            from modules import kokoro_tts
+            return kokoro_tts.synth_wav(cleaned)
     piper = _get_voice()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:

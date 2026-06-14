@@ -405,6 +405,28 @@ def _speak_stream(delta_iter):
             _emit("I've put it on your screen.")
         panel.show(*artifact)
 
+    # Attach any image the generate_image skill produced this turn. The marker is
+    # appended AFTER speaking (so it's never read aloud) and only to the logged
+    # text, where the chat view renders it as an <img>.
+    try:
+        from modules import imagegen
+        for name in imagegen.take_pending():
+            response = (response + f"\n[[IMAGE:{name}]]").strip()
+            if not speaking:       # image-only reply — acknowledge it aloud
+                _emit("Here's the image.")
+                speaking = True
+    except Exception:
+        pass
+    try:
+        from modules import videogen
+        for name in videogen.take_pending():
+            response = (response + f"\n[[VIDEO:{name}]]").strip()
+            if not speaking:       # video-only reply — acknowledge it aloud
+                _emit("Here's the video.")
+                speaking = True
+    except Exception:
+        pass
+
     live.flush()          # make sure the final reply text reaches the view
     print(flush=True)
     speaker.close()       # blocks until all audio has finished playing
@@ -442,18 +464,72 @@ def _go_to_sleep() -> bool:
     return True
 
 
+def _gpu_throttle() -> str:
+    """Sample the GPU's recent load and cap Cleo's compute to the headroom another
+    app (a game, etc.) leaves free, via MPS — so she time-shares the card instead
+    of fighting it. Restores the baseline cap when nothing else is busy. Returns a
+    spoken note when a throttle is in effect, else ''.
+
+    Must run BEFORE any GPU model loads: re-capping resets the CUDA primary
+    context, which is only safe while no context exists."""
+    if not config.GPU_ADAPTIVE_THROTTLE:
+        return ""
+    load = gpu.sample_load(config.GPU_LOAD_SAMPLE_SECONDS)
+    if load is None:
+        return ""                         # no NVIDIA GPU — nothing to adapt
+    avg_util = load[0]
+    cap = gpu.adaptive_compute_percent(avg_util)
+    desired = cap if cap is not None else config.GPU_COMPUTE_PERCENT
+    applied = True
+    if desired != gpu.current_percent():  # only reset the context when it changes
+        applied = gpu.set_compute_percent(desired)
+    if cap is not None and applied:
+        print(f"[GPU] Other apps averaging {avg_util}% — capping Cleo to {cap}%.")
+        return f"Running at {cap} percent capacity due to application interference."
+    return ""
+
+
+def _gpu_fit_llm() -> str:
+    """Choose a quant / GPU-offload for the LLM that fits the VRAM free RIGHT NOW,
+    and register it as the load override. Call AFTER Whisper has loaded (so the
+    free-VRAM reading already accounts for it) and BEFORE the LLM loads. Returns a
+    spoken note on a downgrade, else ''. Prevents the LLM from over-committing
+    VRAM and OOM-crashing the process on its first generation."""
+    if not config.GPU_ADAPTIVE_THROTTLE:
+        return ""
+    free = gpu.free_mb()
+    if free is None:
+        return ""
+    plan = config.wake_load_plan(free)
+    if not plan:
+        return ""
+    llm.set_load_override(plan["gguf"], plan["gpu_layers"])
+    if plan["downgraded"]:
+        print(f"[GPU] {free} MiB free — loading {plan['quant']} "
+              f"(layers={plan['gpu_layers']}).")
+        return f"Downgraded to {plan['quant']} due to memory constraints."
+    if plan["gpu_layers"] != -1:          # fits only with some layers on the CPU
+        print(f"[GPU] {free} MiB free — {plan['quant'] or 'model'} on "
+              f"{plan['gpu_layers']} GPU layers (rest on CPU).")
+    return ""
+
+
 def _wake_up() -> bool:
     print("[Sleep] Wake command heard — reloading model...")
     _asleep_flag.clear()
-    llm.warmup()
+    tnote = _gpu_throttle()        # cap compute to the free headroom (before any load)
     if not NATIVE_AUDIO:
-        stt._get_model()
+        stt._get_model()           # GPU Whisper first, so the VRAM read below is real
+    fnote = _gpu_fit_llm()         # pick a quant/offload that fits what's left
+    llm.warmup()
     if config.WAKE_WORD_MODEL:
-        stt.unload_spotter()   # custom wake phrases keep using the spotter
-    print(f"Assistant: {config.WAKE_REPLY}\n")
+        stt.unload_spotter()       # custom wake phrases keep using the spotter
+    notes = " ".join(n for n in (tnote, fnote) if n)
+    reply = f"{config.WAKE_REPLY} {notes}".strip() if notes else config.WAKE_REPLY
+    print(f"Assistant: {reply}\n")
     status.set_state("speaking")
-    chatlog.log("assistant", config.WAKE_REPLY)
-    tts.speak(config.WAKE_REPLY)
+    chatlog.log("assistant", reply)
+    tts.speak(reply)
     return False
 
 
@@ -581,16 +657,37 @@ def _text_input_watcher() -> None:
 
 
 def main():
+    if not config.LLM_ENABLED:
+        print("Language model is set to None (image-only mode).\n"
+              "The voice assistant needs a language model, so there's nothing for\n"
+              "this service to do. Use the control panel's image page (/image) to\n"
+              "generate images, or pick a language model in the panel to enable voice.")
+        return
+
     _check_model_file()
 
     # Apply the GPU compute cap BEFORE any model touches CUDA, or it won't bind.
     gpu.apply_compute_limit()
+    # The CPU cap is enforced via thread counts set at import (config), applied
+    # when the model loads; just report it here so the active limit is visible.
+    if config.CPU_COMPUTE_PERCENT < 100:
+        print(f"[CPU] Compute capped to {config.CPU_COMPUTE_PERCENT}% — "
+              f"{config.LLM_N_THREADS} of {config.CPU_PHYSICAL_CORES} cores.")
 
     print(f"Loading models (mode: {'native audio' if NATIVE_AUDIO else 'whisper'})...")
+
+    # Adapt to the GPU before loading anything onto it. Order matters: throttle
+    # (which resets the CUDA context) must come first, then Whisper, then fit the
+    # LLM to the VRAM actually left. Without the fit step the LLM + Whisper (+ a
+    # running game) overcommit VRAM and the first generation OOMs — which
+    # llama.cpp turns into a hard process abort, not a catchable error, taking the
+    # whole service down. The same two steps run at wake.
+    _gpu_throttle()
 
     # Pre-load only what this mode needs.
     if not NATIVE_AUDIO:
         stt._get_model()
+    _gpu_fit_llm()
     llm.warmup()
     tts.warmup()
 

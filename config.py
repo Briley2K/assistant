@@ -10,6 +10,12 @@ import openwakeword as _oww
 _BASE = os.path.dirname(__file__)
 SETTINGS_PATH = os.path.join(_BASE, "settings.json")
 
+# Where browser-uploaded custom models land. A model selection of "custom:<file>"
+# (LLM .gguf or image .safetensors/.ckpt) resolves to a file in these dirs.
+CUSTOM_GGUF_DIR  = os.path.join(_BASE, "models", "custom-gguf")
+CUSTOM_IMAGE_DIR = os.path.join(_BASE, "models", "custom-image")
+CUSTOM_VIDEO_DIR = os.path.join(_BASE, "models", "custom-video")
+
 # Bundled openWakeWord models live here; a wake-word key maps to "<key>_v0.1".
 _OWW_DIR = os.path.join(os.path.dirname(_oww.__file__), "resources", "models")
 # Phrases with a pretrained openWakeWord model (instant, near-zero CPU). Any
@@ -62,6 +68,50 @@ LLM_MODELS = {
              "lmstudio-community/gemma-4-12B-it-GGUF"),
         ],
     },
+    "gemma4-12b-coder": {
+        # Community coding fine-tune of Gemma 4 12B (text-only — the GGUF repo has
+        # no mmproj, so speech uses Whisper, not native audio). Q4_K_M is the
+        # balanced quant; the repo also ships Q2_K / Q6_K / Q8_0 if you swap the
+        # filename. A bigger token budget than the base chat model so longer code
+        # answers aren't cut off (these go to the side panel, not spoken aloud).
+        "label":  "Gemma 4 12B Coder (local · text · coding)",
+        "ollama": "gemma4-12b-coder",
+        "gguf":   "gemma4-coding-Q4_K_M.gguf",   # default; overridden by selected quant
+        "mmproj": None,
+        "max_tokens": 1024,
+        "hf_repo": "yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF",
+        "dirs":   [os.path.join(_BASE, "models", "gemma-coder")],
+        # Selectable quants (the panel shows a picker + a VRAM-fit bar). size_gb is
+        # the on-disk GGUF size; the loader needs that plus ~2GB headroom on the GPU.
+        "quants": [
+            {"name": "Q2_K",   "gguf": "gemma4-coding-Q2_K.gguf",   "size_gb": 4.83},
+            {"name": "Q4_K_M", "gguf": "gemma4-coding-Q4_K_M.gguf", "size_gb": 7.38, "default": True},
+            {"name": "Q6_K",   "gguf": "gemma4-coding-Q6_K.gguf",   "size_gb": 9.79},
+            {"name": "Q8_0",   "gguf": "gemma4-coding-Q8_0.gguf",   "size_gb": 12.67},
+        ],
+    },
+    "gemma4-12b-obliterated": {
+        # Abliterated (uncensored) Gemma 4 12B — safety guardrails removed via
+        # weight surgery, text-only GGUF (no mmproj, so speech uses Whisper, not
+        # native audio). Q4_K_M is the balanced quant; the repo also ships
+        # Q5_K_M / Q6_K / Q8_0 / BF16.
+        "label":  "Gemma 4 12B Obliterated (local · text · uncensored)",
+        "ollama": "gemma4-12b-obliterated",
+        "gguf":   "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf",   # default; overridden by selected quant
+        "mmproj": None,
+        "max_tokens": 1024,
+        "hf_repo": "OBLITERATUS/Gemma-4-12B-OBLITERATED",
+        "dirs":   [os.path.join(_BASE, "models", "gemma-obliterated")],
+        # Selectable quants (the panel shows a picker + a VRAM-fit bar). size_gb is
+        # the on-disk GGUF size; the loader needs that plus ~2GB headroom on the GPU.
+        "quants": [
+            {"name": "Q4_K_M", "gguf": "Gemma-4-12B-OBLITERATED-Q4_K_M.gguf", "size_gb": 6.9, "default": True},
+            {"name": "Q5_K_M", "gguf": "Gemma-4-12B-OBLITERATED-Q5_K_M.gguf", "size_gb": 8.0},
+            {"name": "Q6_K",   "gguf": "Gemma-4-12B-OBLITERATED-Q6_K.gguf",   "size_gb": 9.1},
+            {"name": "Q8_0",   "gguf": "Gemma-4-12B-OBLITERATED-Q8_0.gguf",   "size_gb": 12.7},
+            {"name": "BF16",   "gguf": "Gemma-4-12B-OBLITERATED-BF16.gguf",   "size_gb": 22.0},
+        ],
+    },
     "nemotron-3-nano-omni-30b": {
         "label":  "NVIDIA Nemotron 3 Nano Omni 30B-A3B",
         # Multimodal MoE (30B total / ~3B active). Run options:
@@ -80,16 +130,59 @@ LLM_MODELS = {
         # here is the file the Download button fetches and the loader expects.
         "gguf":   "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-UD-IQ4_XS.gguf",
         "mmproj": None,
+        # Reasoning model: the chat template opens the turn in a <think> block, so
+        # generation starts with chain-of-thought and the real answer only follows
+        # the closing </think>. The reasoning is stripped from spoken output (see
+        # modules/llm.py). It needs a larger token budget than a chat model so the
+        # answer isn't cut off by a long think.
+        "reasoning":  True,
+        "max_tokens": 2048,
         "hf_repo": "unsloth/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-GGUF",
         "dirs":   [os.path.join(_BASE, "models", "nemotron")],
     },
 }
 
-# Selected model (key into LLM_MODELS); falls back to Gemma if unknown.
+# Selected model (key into LLM_MODELS); "none" disables the language model
+# entirely (image-only mode — use the panel's /image page). Falls back to Gemma
+# if set to something unknown.
 LLM_MODEL = _S.get("llm_model", "gemma4-12b")
-if LLM_MODEL not in LLM_MODELS:
+_IS_CUSTOM_LLM = isinstance(LLM_MODEL, str) and LLM_MODEL.startswith("custom:")
+if LLM_MODEL != "none" and not _IS_CUSTOM_LLM and LLM_MODEL not in LLM_MODELS:
     LLM_MODEL = "gemma4-12b"
-_MODEL = LLM_MODELS[LLM_MODEL]
+LLM_ENABLED = LLM_MODEL != "none"
+# A custom uploaded GGUF has no registry entry (text-only, llama-cpp).
+_MODEL = LLM_MODELS.get(LLM_MODEL) if LLM_ENABLED else None
+
+
+# --- Quant variants ---
+# A model may ship several quantizations (Q4_K_M, Q8_0, …); the panel exposes a
+# picker and stores the choice per-model in settings ("model_quants": {key: name}).
+# Single-file models (no "quants") behave exactly as before.
+def model_quants(key: str) -> list:
+    """The quant variants for a model key, or [] if it ships a single file."""
+    return (LLM_MODELS.get(key) or {}).get("quants") or []
+
+
+def _default_quant(quants: list) -> dict | None:
+    if not quants:
+        return None
+    return next((q for q in quants if q.get("default")), quants[0])
+
+
+def selected_quant(key: str) -> dict | None:
+    """The quant chosen for a model in settings, else its default, else None for a
+    single-file model."""
+    quants = model_quants(key)
+    if not quants:
+        return None
+    want = (_S.get("model_quants") or {}).get(key)
+    return next((q for q in quants if q["name"] == want), None) or _default_quant(quants)
+
+
+def gguf_for(key: str) -> str:
+    """GGUF filename for a model key, honoring its selected quant."""
+    q = selected_quant(key)
+    return q["gguf"] if q else LLM_MODELS[key]["gguf"]
 
 
 def _find_gguf(filename: str, dirs: list[str]) -> str:
@@ -100,8 +193,14 @@ def _find_gguf(filename: str, dirs: list[str]) -> str:
     return os.path.join(dirs[0], filename)
 
 
-LLM_MODEL_PATH  = _find_gguf(_MODEL["gguf"], _MODEL["dirs"])
-LLM_MMPROJ_PATH = _find_gguf(_MODEL["mmproj"], _MODEL["dirs"]) if _MODEL["mmproj"] else None
+if not LLM_ENABLED:
+    LLM_MODEL_PATH = None
+elif _IS_CUSTOM_LLM:
+    LLM_MODEL_PATH = os.path.join(CUSTOM_GGUF_DIR, LLM_MODEL.split(":", 1)[1])
+else:
+    LLM_MODEL_PATH = _find_gguf(gguf_for(LLM_MODEL), _MODEL["dirs"])
+LLM_MMPROJ_PATH = (_find_gguf(_MODEL["mmproj"], _MODEL["dirs"])
+                   if LLM_ENABLED and _MODEL and _MODEL["mmproj"] else None)
 
 # True if the selected model can hear audio directly (has an mmproj projector).
 NATIVE_AUDIO_OK = LLM_MMPROJ_PATH is not None
@@ -117,7 +216,7 @@ if STT_MODE == "native" and not NATIVE_AUDIO_OK:
 LLM_BACKEND  = _S.get("llm_backend", "auto")
 OLLAMA_HOST  = _S.get("ollama_host", "http://localhost:11434")
 # Blank "ollama_model" → use the selected model's default tag from LLM_MODELS.
-OLLAMA_MODEL = (_S.get("ollama_model") or "").strip() or _MODEL["ollama"]
+OLLAMA_MODEL = (_S.get("ollama_model") or "").strip() or (_MODEL["ollama"] if _MODEL else "")
 
 # Remote OpenAI-compatible API (used when LLM_BACKEND == "api").
 _API         = _S.get("api", {})
@@ -128,6 +227,11 @@ API_MODEL    = _API.get("model", "")
 LLM_N_CTX        = 4096
 LLM_TEMPERATURE  = 0.7
 CONTEXT_TURNS    = 10       # max conversation turns to keep in memory
+
+# Reasoning models wrap chain-of-thought in <think>…</think> that must never be
+# spoken; LLM_MAX_TOKENS gives them room to think and still answer in one pass.
+LLM_REASONING    = bool(_MODEL.get("reasoning", False)) if _MODEL else False
+LLM_MAX_TOKENS   = int(_MODEL.get("max_tokens", 512)) if _MODEL else 512
 
 # Where to run the LLM: "auto" (GPU if it has enough free VRAM, else CPU),
 # "gpu" (force full GPU offload), or "cpu". "auto" is the default.
@@ -142,8 +246,24 @@ LLM_GPU_LAYERS = str(_S.get("llm_gpu_layers", "")).strip().lower()
 
 # Cap on the share of GPU *compute* (SMs) Cleo may use, 10-100. 100 = no limit.
 # Enforced via NVIDIA MPS (modules/gpu.py); does not affect VRAM. Applied at
-# startup, so a change takes effect on the next assistant restart.
+# startup; the adaptive throttle below can tighten it live at wake.
 GPU_COMPUTE_PERCENT = max(10, min(100, int(_S.get("gpu_compute_percent", 100))))
+
+# --- Adaptive GPU throttle (decided live, when waking) ---
+# On wake, sample the GPU's recent load and adapt to whatever ELSE is using the
+# card (Cleo is fully unloaded while asleep, so the load measured is other apps'):
+#   • cap Cleo's GPU compute to the free headroom via MPS, so she time-shares the
+#     card instead of fighting a game/app for it, and
+#   • drop to a smaller, locally-present quant that fits the free VRAM.
+GPU_ADAPTIVE_THROTTLE    = bool(_S.get("gpu_adaptive_throttle", True))
+# Seconds to average GPU utilization over before deciding the cap (the user-facing
+# "usage over the past N seconds"). Bigger = steadier reading but a slower wake.
+GPU_LOAD_SAMPLE_SECONDS  = max(1.0, float(_S.get("gpu_load_sample_seconds", 5.0)))
+# Never throttle below this — a floor so Cleo stays usable even under a heavy game.
+GPU_MIN_COMPUTE_PERCENT  = max(5, min(100, int(_S.get("gpu_min_compute_percent", 10))))
+# Only treat the GPU as "busy with another app" once its recent average
+# utilization reaches this; below it Cleo runs at her normal baseline cap.
+GPU_INTERFERENCE_PERCENT = max(0, min(100, int(_S.get("gpu_interference_percent", 50))))
 
 # Headroom on top of the model file(s) for the KV cache (n_ctx) and compute
 # buffers — the model needs more VRAM than its on-disk size.
@@ -167,6 +287,28 @@ def _gpu_free_mb() -> int | None:
     return max(vals) if vals else None
 
 
+def gpu_total_mb() -> int | None:
+    """Total VRAM (MB) on the largest CUDA device, or None if there's no usable
+    NVIDIA GPU. Used by the control panel's VRAM-fit bar."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+    return max(vals) if vals else None
+
+
+# VRAM headroom (GB) the panel adds on top of the model file for its fit estimate:
+# the KV cache (n_ctx) and compute buffers the model needs beyond its on-disk size.
+VRAM_OVERHEAD_GB = _VRAM_OVERHEAD_MB / 1024
+
+
 def _llm_vram_need_mb() -> int:
     """Estimated VRAM to fit the LLM fully on the GPU: model file(s) + overhead."""
     need = _VRAM_OVERHEAD_MB
@@ -174,14 +316,81 @@ def _llm_vram_need_mb() -> int:
     if STT_MODE == "native" and LLM_MMPROJ_PATH:
         paths.append(LLM_MMPROJ_PATH)     # mmproj is co-loaded for native audio
     for p in paths:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             need += os.path.getsize(p) // (1024 * 1024)
     return need
+
+
+def _present_quants(key: str) -> list[tuple[dict, str]]:
+    """(quant, resolved_path) for each quant of `key` whose GGUF is on disk."""
+    out = []
+    for q in model_quants(key):
+        p = _find_gguf(q["gguf"], LLM_MODELS[key]["dirs"])
+        if os.path.exists(p):
+            out.append((q, p))
+    return out
+
+
+def wake_load_plan(free_mb: int) -> dict | None:
+    """Pick how to load the selected LLM into `free_mb` of VRAM. Pass the VRAM
+    free *right now*, measured AFTER Whisper/anything else GPU-resident has loaded,
+    so `free_mb` already reflects their footprint (no estimating needed). Returns
+    a dict, or None when there's nothing to adapt (no language model, or a custom
+    single-file GGUF):
+        quant       chosen quant name (None for a single-file model)
+        gguf        GGUF path to load
+        gpu_layers  -1 if the choice fits fully on the GPU, else a conservative
+                    partial-offload count so the load can't OOM
+        downgraded  True only when the chosen quant is SMALLER than the selected
+                    one (i.e. an actual memory-driven downgrade)
+    Only ever downgrades — it won't auto-upgrade to a bigger quant on a free GPU.
+    """
+    if not LLM_ENABLED or _IS_CUSTOM_LLM or not _MODEL:
+        return None
+    avail = free_mb
+
+    def need(file_mb: int) -> int:
+        return file_mb + _VRAM_OVERHEAD_MB
+
+    def layers_for(file_mb: int) -> int:
+        # Fits fully → all layers on GPU. Otherwise offload as many as fit, using
+        # a conservative per-layer estimate so we under-commit rather than OOM.
+        if need(file_mb) <= avail:
+            return -1
+        n = int((_MODEL or {}).get("n_layers", 48))
+        per_layer = max(1, file_mb // max(1, n))
+        return max(0, int((avail - _VRAM_OVERHEAD_MB) // per_layer))
+
+    present = _present_quants(LLM_MODEL)
+    if not present:
+        # Single-file model (or no quant downloaded yet): keep the configured
+        # file, only adjust offload so it still loads under tight VRAM.
+        if LLM_MODEL_PATH and os.path.exists(LLM_MODEL_PATH):
+            file_mb = os.path.getsize(LLM_MODEL_PATH) // (1024 * 1024)
+            return {"quant": None, "gguf": LLM_MODEL_PATH,
+                    "gpu_layers": layers_for(file_mb), "downgraded": False}
+        return None
+
+    def file_mb(q: dict) -> int:
+        return int(q["size_gb"] * 1024)
+
+    fits = [(q, p) for q, p in present if need(file_mb(q)) <= avail]
+    if fits:
+        q, p = max(fits, key=lambda x: x[0]["size_gb"])      # largest that fits
+    else:
+        q, p = min(present, key=lambda x: x[0]["size_gb"])    # smallest we have
+
+    cur = selected_quant(LLM_MODEL)
+    downgraded = bool(cur and q["size_gb"] < cur["size_gb"])
+    return {"quant": q["name"], "gguf": p,
+            "gpu_layers": layers_for(file_mb(q)), "downgraded": downgraded}
 
 
 def _resolve_gpu_layers() -> int:
     """Layers to offload to GPU: -1 = all, 0 = none (CPU), N = first N layers.
     An explicit LLM_GPU_LAYERS wins; otherwise honor LLM_DEVICE."""
+    if not LLM_ENABLED:
+        return 0                            # no language model (image-only mode)
     # Explicit partial-offload override.
     if LLM_GPU_LAYERS not in ("", "auto"):
         if LLM_GPU_LAYERS in ("all", "max", "gpu"):
@@ -204,6 +413,62 @@ def _resolve_gpu_layers() -> int:
 
 # llama-cpp only: number of model layers to put on the GPU (-1 all, 0 CPU, N=partial).
 LLM_N_GPU_LAYERS = _resolve_gpu_layers()
+
+# --- CPU compute cap ---
+# When a big model runs on the CPU, every physical core pins to 100% the instant
+# a question starts processing. That all-core saturation can starve the desktop
+# of CPU and hard-lock the machine (it froze hard enough to need a power-off —
+# no OOM, nothing logged). The mirror of GPU_COMPUTE_PERCENT: cap the share of
+# CPU cores Cleo may use, 10-100. 100 = no limit. Applied on the next restart.
+CPU_COMPUTE_PERCENT = max(10, min(100, int(_S.get("cpu_compute_percent", 100))))
+
+
+def _physical_cores() -> int:
+    """Physical CPU cores (what llama-cpp itself defaults n_threads to), so a CPU
+    percentage maps to a sensible thread cap instead of oversubscribing SMT
+    siblings. Falls back to the logical count if /proc/cpuinfo is unreadable."""
+    try:
+        seen, phys, core = set(), None, None
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                key, _, val = line.partition(":")
+                key, val = key.strip(), val.strip()
+                if key == "physical id":
+                    phys = val
+                elif key == "core id":
+                    core = val
+                elif key == "" and phys is not None and core is not None:
+                    seen.add((phys, core)); phys = core = None
+        if phys is not None and core is not None:
+            seen.add((phys, core))
+        return len(seen) or (os.cpu_count() or 8)
+    except OSError:
+        return os.cpu_count() or 8
+
+
+CPU_PHYSICAL_CORES = _physical_cores()
+
+# CPU threads for the local llama-cpp backend. An explicit "llm_threads" wins
+# (advanced override); otherwise the CPU compute cap drives it — N% of the
+# physical cores, rounded, leaving the rest free for the desktop. "" / "auto"
+# with a 100% cap means the llama-cpp default (all physical cores).
+_threads_raw = str(_S.get("llm_threads", "")).strip().lower()
+if _threads_raw not in ("", "auto"):
+    try:
+        LLM_N_THREADS = max(1, int(_threads_raw))
+    except ValueError:
+        LLM_N_THREADS = None
+elif CPU_COMPUTE_PERCENT < 100:
+    LLM_N_THREADS = max(1, round(CPU_PHYSICAL_CORES * CPU_COMPUTE_PERCENT / 100))
+else:
+    LLM_N_THREADS = None
+
+# Cap OpenMP-based native libraries (Whisper on CPU, numpy/BLAS, ctranslate2) to
+# the same thread budget so the limit covers *anything* Cleo runs on the CPU, not
+# just llama-cpp. Must be set before those libraries are imported — config is
+# imported before any of them, so this is early enough to take effect.
+if LLM_N_THREADS is not None:
+    os.environ["OMP_NUM_THREADS"] = str(LLM_N_THREADS)
 
 SYSTEM_PROMPT = _S.get(
     "system_prompt",
@@ -257,6 +522,42 @@ CHATLOG_PATH    = os.path.join(_BASE, "logs", "chat.jsonl")
 # --- Skills / tools ---
 SKILLS_ENABLED  = bool(_S.get("skills", True))
 SKILLS_DISABLED = set(_S.get("skills_disabled", []))   # skill names to turn off
+
+# --- File access (read-only) ---
+# Cleo can read files on this machine, but ONLY inside the folders you grant
+# (FILE_ACCESS_ROOTS) and never anything matching the blacklist. Both are managed
+# from the control panel. Disabled by default — and even when enabled, nothing is
+# readable until you add at least one allowed folder. Reads are size-capped
+# (FILE_ACCESS_MAX_KB) and binary files are refused, so a stray read can't flood
+# the model or dump a blob. See modules/skills/files.py for the enforcement.
+#
+# Blacklist entries are matched against each candidate's resolved (realpath) path:
+# an entry containing * ? or [ is treated as a glob (tested against the full path
+# AND the bare filename); anything else is a literal path or parent folder to
+# block. The defaults below shield common secrets even inside an allowed folder.
+DEFAULT_FILE_BLACKLIST = [
+    "*.env", ".env", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "*.kdbx",
+    "*/.ssh/*", "*/.aws/*", "*/.gnupg/*", "*secret*", "*password*",
+    "*credentials*", "*.sqlite", "*.sqlite3",
+    os.path.join(_BASE, "settings.json"),   # holds Cleo's own API key
+]
+
+
+def _expand_paths(items) -> list[str]:
+    """Normalize a list of user-entered paths/patterns: drop blanks, expand ~ and
+    $VARS. Globs pass through unchanged (expanduser/expandvars only touch ~ / $)."""
+    out = []
+    for p in items or []:
+        p = str(p).strip()
+        if p:
+            out.append(os.path.expanduser(os.path.expandvars(p)))
+    return out
+
+
+FILE_ACCESS_ENABLED   = bool(_S.get("file_access", False))
+FILE_ACCESS_ROOTS     = _expand_paths(_S.get("file_access_roots", []))
+FILE_ACCESS_BLACKLIST = _expand_paths(_S.get("file_access_blacklist", DEFAULT_FILE_BLACKLIST))
+FILE_ACCESS_MAX_KB    = max(1, int(_S.get("file_access_max_kb", 256)))
 
 # Weather skill default ("home") location. Set a place name in the control
 # panel; lat/lon are optional and take precedence if both are given.
@@ -326,6 +627,146 @@ def neutts_voices() -> list[str]:
                       and os.path.exists(os.path.join(_NEUTTS_SAMPLES, f[:-4] + ".txt")))
     except OSError:
         return ["jo"]
+
+
+# Chatterbox (Resemble AI) — high-quality voice cloning that runs on the GPU. Like
+# NeuTTS it lives in its own venv (chatterbox/.venv, CUDA torch + chatterbox-tts)
+# and is driven via a localhost helper (see modules/chatterbox_tts.py). It clones
+# from an audio prompt alone — no transcript — so it reuses the NeuTTS sample clips.
+_CB_DIR           = os.path.join(_BASE, "chatterbox")
+CHATTERBOX_PYTHON = os.path.join(_CB_DIR, ".venv", "bin", "python")
+CHATTERBOX_SERVER = os.path.join(_CB_DIR, "chatterbox_server.py")
+CHATTERBOX_PORT   = int(_S.get("chatterbox_port", 5009))
+CHATTERBOX_DEVICE = _S.get("chatterbox_device", "cuda")          # "cuda" or "cpu"
+# Reference voice: a name in neutts_test/samples or an absolute path to a .wav.
+# Defaults to whatever NeuTTS voice is set so switching engines keeps the voice.
+CHATTERBOX_VOICE  = _S.get("chatterbox_voice") or _S.get("neutts_voice", "sophon_2")
+# Expressiveness / pacing / sampling knobs passed to generate().
+CHATTERBOX_EXAGGERATION = float(_S.get("chatterbox_exaggeration", 0.5))
+CHATTERBOX_CFG          = float(_S.get("chatterbox_cfg", 0.5))
+CHATTERBOX_TEMPERATURE  = float(_S.get("chatterbox_temperature", 0.8))
+# Approx VRAM (GB) the Chatterbox model holds on the GPU — shown in the control
+# panel's VRAM bar, stacked on top of the LLM, so you can see if both fit.
+CHATTERBOX_VRAM_GB      = float(_S.get("chatterbox_vram_gb", 4.75))
+
+
+def chatterbox_ref_wav() -> str:
+    """Reference .wav for the configured Chatterbox voice (reuses the NeuTTS
+    sample clips; a bare name maps into neutts_test/samples)."""
+    v = CHATTERBOX_VOICE
+    if os.path.isabs(v):
+        return v if v.endswith(".wav") else v + ".wav"
+    return os.path.join(_NEUTTS_SAMPLES, f"{v}.wav")
+
+
+# Image generation (Stable Diffusion via diffusers). Same isolation pattern as
+# NeuTTS/Chatterbox: it lives in its own venv (imagegen/.venv, CUDA torch +
+# diffusers) and is driven via a localhost helper (modules/imagegen.py +
+# imagegen/imagegen_server.py). The model can call it through the generate_image
+# skill; generated PNGs land in logs/images and render inline in the chat window.
+_IMAGEGEN_DIR    = os.path.join(_BASE, "imagegen")
+IMAGEGEN_PYTHON  = os.path.join(_IMAGEGEN_DIR, ".venv", "bin", "python")
+IMAGEGEN_SERVER  = os.path.join(_IMAGEGEN_DIR, "imagegen_server.py")
+IMAGEGEN_PORT    = int(_S.get("imagegen_port", 5010))
+
+# Image-model catalog (diffusers model ids). Like LLM_MODELS, picking an entry in
+# the panel is all that's needed; the helper downloads the weights from
+# HuggingFace on first generation. "vram_gb" is a rough fp16 working-set estimate
+# (for the fit hint); "size" is the model's native resolution.
+IMAGEGEN_MODELS = {
+    "sd-turbo": {
+        "label": "SD-Turbo — fast, ~4 GB VRAM (512px)",
+        "repo":  "stabilityai/sd-turbo", "vram_gb": 4.0, "size": 512, "dl_gb": 5.0,
+    },
+    "sdxl-turbo": {
+        "label": "SDXL-Turbo — sharper, ~8 GB VRAM (512px)",
+        "repo":  "stabilityai/sdxl-turbo", "vram_gb": 8.0, "size": 512, "dl_gb": 7.0,
+    },
+    "sdxl": {
+        "label": "SDXL 1.0 — best quality, ~10 GB VRAM (1024px)",
+        "repo":  "stabilityai/stable-diffusion-xl-base-1.0", "vram_gb": 10.0, "size": 1024, "dl_gb": 7.0,
+    },
+    # Flux is text-to-IMAGE (not video) — it lives here, not in the video section.
+    # FLUX.2 [klein] is the small/open variant; verify the repo id if it 404s.
+    "flux2-klein": {
+        "label": "FLUX.2 Klein — high quality (1024px, heavy)",
+        "repo":  "black-forest-labs/FLUX.2-klein", "vram_gb": 14.0, "size": 1024, "dl_gb": 24.0,
+    },
+}
+
+# Selected image model (key into IMAGEGEN_MODELS); "none" disables generation.
+IMAGE_MODEL = _S.get("image_model", "none")
+_IS_CUSTOM_IMG = isinstance(IMAGE_MODEL, str) and IMAGE_MODEL.startswith("custom:")
+if IMAGE_MODEL != "none" and not _IS_CUSTOM_IMG and IMAGE_MODEL not in IMAGEGEN_MODELS:
+    IMAGE_MODEL = "none"
+IMAGEGEN_ENABLED  = IMAGE_MODEL != "none"
+if not IMAGEGEN_ENABLED:
+    IMAGEGEN_REPO, IMAGEGEN_IMG_SIZE = None, 512
+elif _IS_CUSTOM_IMG:
+    # A custom uploaded checkpoint: REPO is its local file path; the helper loads
+    # it with from_single_file. Resolution guessed from the name (SDXL → 1024px).
+    _fname = IMAGE_MODEL.split(":", 1)[1]
+    IMAGEGEN_REPO = os.path.join(CUSTOM_IMAGE_DIR, _fname)
+    IMAGEGEN_IMG_SIZE = 1024 if "xl" in _fname.lower() else 512
+else:
+    _IMG = IMAGEGEN_MODELS[IMAGE_MODEL]
+    IMAGEGEN_REPO = _IMG["repo"]          # diffusers id the helper loads
+    IMAGEGEN_IMG_SIZE = _IMG["size"]
+IMAGEGEN_DEVICE   = _S.get("image_device", "cuda")     # "cuda" or "cpu"
+IMAGEGEN_STEPS    = int(_S.get("image_steps", 0))      # 0 = model-appropriate default
+# Where generated PNGs are written (and served from by the control panel).
+IMAGEGEN_OUT_DIR  = os.path.join(_BASE, "logs", "images")
+
+
+# Video generation (diffusers text-to-video). Same isolation pattern as image gen:
+# its own venv (video/.venv, CUDA torch + diffusers + imageio-ffmpeg), driven via
+# a localhost helper (modules/videogen.py + video/video_server.py). Selecting a
+# model in the panel is all that's needed; weights download on first generation.
+# These repos are new/fast-moving — verify/adjust the repo ids if one 404s, or
+# just upload your own checkpoint.
+_VIDEO_DIR       = os.path.join(_BASE, "video")
+VIDEOGEN_PYTHON  = os.path.join(_VIDEO_DIR, ".venv", "bin", "python")
+VIDEOGEN_SERVER  = os.path.join(_VIDEO_DIR, "video_server.py")
+VIDEOGEN_PORT    = int(_S.get("videogen_port", 5011))
+
+VIDEOGEN_MODELS = {
+    "wan-1.3b": {
+        "label": "Wan 2.1 T2V 1.3B — lightest, fits 16 GB (480p)",
+        "repo":  "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "vram_gb": 12.0, "size": 480, "frames": 81, "fps": 16, "dl_gb": 17.0,
+    },
+    "ltx-2": {
+        "label": "LTX-2 (LTX-Video) — fast, longer clips (704px)",
+        "repo":  "Lightricks/LTX-Video",
+        "vram_gb": 12.0, "size": 704, "frames": 97, "fps": 24, "dl_gb": 18.0,
+    },
+    "wan-14b": {
+        "label": "Wan 2.1 T2V 14B — best quality (needs 24 GB+)",
+        "repo":  "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        "vram_gb": 40.0, "size": 720, "frames": 81, "fps": 16, "dl_gb": 33.0,
+    },
+}
+
+VIDEO_MODEL = _S.get("video_model", "none")
+_IS_CUSTOM_VID = isinstance(VIDEO_MODEL, str) and VIDEO_MODEL.startswith("custom:")
+if VIDEO_MODEL != "none" and not _IS_CUSTOM_VID and VIDEO_MODEL not in VIDEOGEN_MODELS:
+    VIDEO_MODEL = "none"
+VIDEOGEN_ENABLED = VIDEO_MODEL != "none"
+if not VIDEOGEN_ENABLED:
+    VIDEOGEN_REPO, VIDEOGEN_SIZE, VIDEOGEN_FRAMES, VIDEOGEN_FPS = None, 480, 81, 16
+elif _IS_CUSTOM_VID:
+    _vfname = VIDEO_MODEL.split(":", 1)[1]
+    VIDEOGEN_REPO = os.path.join(CUSTOM_VIDEO_DIR, _vfname)
+    VIDEOGEN_SIZE, VIDEOGEN_FRAMES, VIDEOGEN_FPS = 480, 81, 16
+else:
+    _VID = VIDEOGEN_MODELS[VIDEO_MODEL]
+    VIDEOGEN_REPO   = _VID["repo"]
+    VIDEOGEN_SIZE   = _VID["size"]
+    VIDEOGEN_FRAMES = _VID["frames"]
+    VIDEOGEN_FPS    = _VID["fps"]
+VIDEOGEN_DEVICE  = _S.get("video_device", "cuda")     # "cuda" or "cpu"
+VIDEOGEN_STEPS   = int(_S.get("video_steps", 0))      # 0 = model-appropriate default
+VIDEOGEN_OUT_DIR = os.path.join(_BASE, "logs", "videos")
 
 
 # Piper

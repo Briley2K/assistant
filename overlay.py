@@ -184,6 +184,19 @@ def main() -> None:
             return True
 
     BASE = os.path.dirname(os.path.abspath(__file__))
+    SETTINGS_PATH = os.path.join(BASE, "settings.json")
+
+    def side_panel_enabled():
+        """The live 'side_panel' toggle from settings.json (default on). Read on
+        each poll rather than once, so turning the switch off hides the panel
+        without a restart — and a stale logs/panel.json can never resurrect it
+        while the feature is off. (The overlay runs under system python without
+        the config module, so it reads settings.json directly.)"""
+        try:
+            with open(SETTINGS_PATH) as f:
+                return bool(json.load(f).get("side_panel", True))
+        except (OSError, ValueError):
+            return True
 
     def tail_jsonl(path, n):
         try:
@@ -595,6 +608,8 @@ def main() -> None:
             whatever conversation/artifact exists); 'hide' removes it entirely.
             The collapse handle stays a manual, on-panel control."""
             if cmd == "show":
+                if not side_panel_enabled():
+                    return                   # feature off — ignore show requests
                 self._refresh_conversation()
                 self.move(self._x, self._y)
                 self.show_all()
@@ -604,6 +619,10 @@ def main() -> None:
                 self.hide()
 
         def _poll(self):
+            if not side_panel_enabled():      # switch off → keep the panel hidden
+                if self.get_visible():
+                    self.hide()
+                return True
             if self.get_visible() and not self.collapsed:
                 self._refresh_conversation()
             try:

@@ -28,6 +28,10 @@ BACKBONE = os.environ.get("NEUTTS_BACKBONE", "neuphonic/neutts-air-q4-gguf")
 REF_WAV = os.environ.get("NEUTTS_REF_WAV", os.path.join(HERE, "samples", "jo.wav"))
 REF_TXT = os.environ.get("NEUTTS_REF_TXT", os.path.join(HERE, "samples", "jo.txt"))
 SAMPLE_RATE = 24000
+# A reference clip much longer than ~15s produces too many audio codes and
+# overflows the backbone's context, so infer() fails (surfacing as an HTTP 500).
+# Cap the clip we encode; the transcript should still match the start of the clip.
+REF_MAX_SECS = float(os.environ.get("NEUTTS_REF_MAX_SECS", "18"))
 
 # --- bundled espeak-ng (no system install needed) ---
 try:
@@ -49,6 +53,32 @@ _lock = threading.Lock()   # serialize synthesis (one model instance)
 _ready = threading.Event()
 
 
+def _capped_ref(path: str) -> str:
+    """A reference clip much longer than the backbone's context produces too many
+    audio codes and makes infer() fail (which surfaces to the assistant as an HTTP
+    500 and a silent fall back to Kokoro). If a clip is longer than REF_MAX_SECS,
+    encode a trimmed copy instead; short clips pass through unchanged."""
+    try:
+        with wave.open(path, "rb") as w:
+            fr, ch, sw, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+            secs = n / float(fr)
+            if secs <= REF_MAX_SECS:
+                return path
+            frames = w.readframes(int(REF_MAX_SECS * fr))
+    except Exception as e:
+        print(f"[neutts] could not inspect {os.path.basename(path)} ({e}); using as-is.", flush=True)
+        return path
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), f"neutts_ref_{os.path.basename(path)}")
+    with wave.open(tmp, "wb") as o:
+        o.setnchannels(ch); o.setsampwidth(sw); o.setframerate(fr)
+        o.writeframes(frames)
+    print(f"[neutts] reference {os.path.basename(path)} is {secs:.0f}s — encoding only "
+          f"the first {REF_MAX_SECS:.0f}s (longer overflows the model and would fail).",
+          flush=True)
+    return tmp
+
+
 def _encode_voice(name: str):
     """Return (ref_codes, ref_text) for a voice name, encoding+caching on first
     use. Falls back to the default voice if the named one is missing."""
@@ -58,7 +88,7 @@ def _encode_voice(name: str):
     txt = os.path.join(SAMPLES, f"{name}.txt")
     if not (os.path.exists(wav) and os.path.exists(txt)):
         return _refs[_default_voice]
-    pair = (_tts.encode_reference(wav), open(txt).read().strip())
+    pair = (_tts.encode_reference(_capped_ref(wav)), open(txt).read().strip())
     _refs[name] = pair
     return pair
 
@@ -72,7 +102,7 @@ def _load():
         from neutts import NeuTTS as NeuTTSAir
     _tts = NeuTTSAir(backbone_repo=BACKBONE, backbone_device="cpu",
                      codec_repo="neuphonic/neucodec", codec_device="cpu")
-    _refs[_default_voice] = (_tts.encode_reference(REF_WAV), open(REF_TXT).read().strip())
+    _refs[_default_voice] = (_tts.encode_reference(_capped_ref(REF_WAV)), open(REF_TXT).read().strip())
     _ready.set()
     print(f"[neutts] ready on port {PORT}", flush=True)
 
